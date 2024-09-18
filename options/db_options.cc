@@ -5,8 +5,14 @@
 
 #include "options/db_options.h"
 
+#include <cassert>
 #include <cinttypes>
+#include <cstdint>
+#include <functional>
+#include <random>
+#include <vector>
 
+#include "file/filename.h"
 #include "logging/logging.h"
 #include "options/configurable_helper.h"
 #include "options/options_helper.h"
@@ -14,14 +20,21 @@
 #include "port/port.h"
 #include "rocksdb/advanced_cache.h"
 #include "rocksdb/configurable.h"
+#include "rocksdb/convenience.h"
+#include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/listener.h"
+#include "rocksdb/options.h"
 #include "rocksdb/rate_limiter.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/sst_file_manager.h"
 #include "rocksdb/statistics.h"
+#include "rocksdb/status.h"
 #include "rocksdb/system_clock.h"
 #include "rocksdb/utilities/options_type.h"
+#include "rocksdb/utilities/options_util.h"
 #include "rocksdb/wal_filter.h"
 #include "util/string_util.h"
 
@@ -755,11 +768,49 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       checksum_handoff_file_types(options.checksum_handoff_file_types),
       lowest_used_cache_tier(options.lowest_used_cache_tier),
       compaction_service(options.compaction_service),
-      enforce_single_del_contracts(options.enforce_single_del_contracts) {
+      enforce_single_del_contracts(options.enforce_single_del_contracts),
+      worker_use_remote_flush(options.worker_use_remote_flush),
+      server_remote_flush(options.server_remote_flush),
+      local_index_cache(options.local_index_cache) {
   fs = env->GetFileSystem();
   clock = env->GetSystemClock().get();
   logger = info_log.get();
   stats = statistics.get();
+}
+
+void ImmutableDBOptions::PackLocal(TransferService* node) const {
+  DBOptions dboptions = BuildDBOptions(*this, MutableDBOptions());
+  std::vector<std::string> cf_names_;
+  std::vector<ColumnFamilyOptions> cf_opts_;
+  cf_names_.push_back("default");
+  cf_opts_.push_back(ColumnFamilyOptions());
+  std::string db_options_data_;
+  Status ret = MemPersistRocksDBOptions(dboptions, cf_names_, cf_opts_,
+                                        db_options_data_);
+  assert(ret.ok());
+  size_t len = db_options_data_.length();
+  node->send(&len, sizeof(size_t));
+  node->send(db_options_data_.data(), db_options_data_.length());
+}
+
+void* ImmutableDBOptions::UnPackLocal(TransferService* node) {
+  size_t len = 0;
+  node->receive(&len, sizeof(size_t));
+  std::string mem;
+  mem.resize(len);
+  node->receive(mem.data(), len);
+  DBOptions db_options = DBOptions();
+  ConfigOptions config_options;
+  std::vector<ColumnFamilyDescriptor> loaded_cf_descs;
+  Status ret = Status::Busy();
+  while (!ret.ok()) {
+    ret =
+        LoadOptionsFromMem(config_options, mem, &db_options, &loaded_cf_descs);
+  }
+  auto* immutable_dboptions = new ImmutableDBOptions();
+  *immutable_dboptions = BuildImmutableDBOptions(db_options);
+  LOG("UnPackaging ImmutableDBOptions");
+  return reinterpret_cast<void*>(immutable_dboptions);
 }
 
 void ImmutableDBOptions::Dump(Logger* log) const {
@@ -899,8 +950,7 @@ void ImmutableDBOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log, "            Options.wal_compression: %d",
                    wal_compression);
   ROCKS_LOG_HEADER(log, "            Options.atomic_flush: %d", atomic_flush);
-  ROCKS_LOG_HEADER(log,
-                   "            Options.avoid_unnecessary_blocking_io: %d",
+  ROCKS_LOG_HEADER(log, "            Options.avoid_unnecessary_blocking_io: %d",
                    avoid_unnecessary_blocking_io);
   ROCKS_LOG_HEADER(log, "                Options.persist_stats_to_disk: %u",
                    persist_stats_to_disk);
@@ -1036,14 +1086,13 @@ void MutableDBOptions::Dump(Logger* log) const {
   ROCKS_LOG_HEADER(log,
                    "                     Options.wal_bytes_per_sync: %" PRIu64,
                    wal_bytes_per_sync);
-  ROCKS_LOG_HEADER(log,
-                   "                  Options.strict_bytes_per_sync: %d",
+  ROCKS_LOG_HEADER(log, "                  Options.strict_bytes_per_sync: %d",
                    strict_bytes_per_sync);
   ROCKS_LOG_HEADER(log,
                    "      Options.compaction_readahead_size: %" ROCKSDB_PRIszt,
                    compaction_readahead_size);
   ROCKS_LOG_HEADER(log, "                 Options.max_background_flushes: %d",
-                          max_background_flushes);
+                   max_background_flushes);
 }
 
 Status GetMutableDBOptionsFromStrings(

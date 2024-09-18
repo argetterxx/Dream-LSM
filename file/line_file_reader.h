@@ -57,4 +57,23 @@ class LineFileReader {
   const IOStatus& GetStatus() const { return io_status_; }
 };
 
+class LineMemReader {
+ private:
+  const std::string& data_;
+  char* buf_begin_ = nullptr;
+  IOStatus io_status_;
+  size_t line_number_ = 0;
+  bool at_eof_ = false;
+
+ public:
+  explicit LineMemReader(const std::string& data)
+      : data_(data), buf_begin_(const_cast<char*>(data_.data())) {}
+
+  LineMemReader(const LineMemReader&) = delete;
+  LineMemReader& operator=(const LineMemReader&) = delete;
+  bool ReadLine(std::string* out);
+  size_t GetLineNumber() const { return line_number_; }
+  const IOStatus& GetStatus() const { return io_status_; }
+};
+
 }  // namespace ROCKSDB_NAMESPACE

@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <set>
 
 #include "utilities/transactions/write_prepared_txn.h"
@@ -336,4 +335,3 @@ class WriteUnpreparedTxn : public WritePreparedTxn {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

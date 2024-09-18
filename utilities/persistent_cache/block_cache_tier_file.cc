@@ -605,4 +605,3 @@ void ThreadedWriter::DispatchIO(const IO& io) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

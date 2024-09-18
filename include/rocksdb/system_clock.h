@@ -9,9 +9,15 @@
 #pragma once
 #include <stdint.h>
 
+#include <cassert>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 
 #include "rocksdb/customizable.h"
+#include "rocksdb/logger.hpp"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 
@@ -26,6 +32,12 @@ struct ConfigOptions;
 // A SystemClock is an interface used by the rocksdb implementation to access
 // operating system time-related functionality.
 class SystemClock : public Customizable {
+ public:
+  virtual void PackLocal(TransferService* node) const {
+    uint8_t type = 0;
+    node->send(&type, sizeof(type));
+  }
+
  public:
   ~SystemClock() override {}
 

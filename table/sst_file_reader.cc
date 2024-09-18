@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "rocksdb/sst_file_reader.h"
 
 #include "db/arena_wrapped_db_iter.h"
@@ -96,4 +95,3 @@ Status SstFileReader::VerifyChecksum(const ReadOptions& read_options) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

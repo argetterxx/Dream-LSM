@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 
+#include <cassert>
 #include <cstdarg>
 #include <functional>
 #include <limits>
@@ -28,6 +29,8 @@
 #include "rocksdb/customizable.h"
 #include "rocksdb/functor_wrapper.h"
 #include "rocksdb/port_defs.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/status.h"
 #include "rocksdb/thread_status.h"
 
@@ -72,6 +75,16 @@ const size_t kDefaultPageSize = 4 * 1024;
 
 // Options while opening a file to read/write
 struct EnvOptions {
+ public:
+  void PackLocal(TransferService* node) const {
+    assert(rate_limiter == nullptr);
+    node->send(reinterpret_cast<const void*>(this), sizeof(EnvOptions));
+  }
+  static void* UnPackLocal(TransferService* node) {
+    void* mem = malloc(sizeof(EnvOptions));
+    node->receive(mem, sizeof(EnvOptions));
+    return mem;
+  }
   // Construct with default Options
   EnvOptions();
 

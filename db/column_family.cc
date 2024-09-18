@@ -9,13 +9,25 @@
 
 #include "db/column_family.h"
 
+#include <sys/socket.h>
+
 #include <algorithm>
+#include <cassert>
+#include <chrono>
 #include <cinttypes>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
+#include "cache/cache_reservation_manager.h"
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction_picker.h"
@@ -23,23 +35,42 @@
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/db_impl/db_impl.h"
+#include "db/dbformat.h"
 #include "db/internal_stats.h"
 #include "db/job_context.h"
+#include "db/memtable.h"
+#include "db/memtable_list.h"
 #include "db/range_del_aggregator.h"
+#include "db/table_cache.h"
 #include "db/table_properties_collector.h"
+#include "db/tcprw.h"
 #include "db/version_set.h"
 #include "db/write_controller.h"
 #include "file/sst_file_manager_impl.h"
 #include "logging/logging.h"
+#include "monitoring/instrumented_mutex.h"
 #include "monitoring/thread_status_util.h"
+#include "options/cf_options.h"
+#include "options/db_options.h"
 #include "options/options_helper.h"
 #include "port/port.h"
+#include "rocksdb/blockingconcurrentqueue.h"
+#include "rocksdb/configurable.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/env.h"
+#include "rocksdb/logger.hpp"
+#include "rocksdb/options.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/table.h"
+#include "rocksdb/write_buffer_manager.h"
 #include "table/merging_iterator.h"
+#include "table/table_properties_collector_pack_factory.h"
+#include "trace_replay/trace_replay.h"
 #include "util/autovector.h"
 #include "util/cast_util.h"
 #include "util/compression.h"
+#include "util/thread_local.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -75,6 +106,7 @@ ColumnFamilyHandleImpl::~ColumnFamilyHandleImpl() {
           db_->immutable_db_options().avoid_unnecessary_blocking_io;
       db_->PurgeObsoleteFiles(job_context, defer_purge);
     }
+    LOG("traccking test");
     job_context.Clean();
   }
 }
@@ -256,6 +288,10 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
   if (result.max_write_buffer_number < 2) {
     result.max_write_buffer_number = 2;
   }
+
+  if (result.max_local_write_buffer_number < 2) {
+    result.max_local_write_buffer_number = 2;
+  }
   // fall back max_write_buffer_number_to_maintain if
   // max_write_buffer_size_to_maintain is not set
   if (result.max_write_buffer_size_to_maintain < 0) {
@@ -355,6 +391,9 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
   if (result.cf_paths.empty()) {
     result.cf_paths = db_options.db_paths;
   }
+  if (db_options.server_remote_flush != 0) {
+    result.server_use_remote_flush = true;
+  }
 
   if (result.level_compaction_dynamic_level_bytes) {
     if (result.compaction_style != kCompactionStyleLevel) {
@@ -440,9 +479,11 @@ void* const SuperVersion::kSVInUse = &SuperVersion::dummy;
 void* const SuperVersion::kSVObsolete = nullptr;
 
 SuperVersion::~SuperVersion() {
+  LOG("SuperVersion::~SuperVersion");
   for (auto td : to_delete) {
     delete td;
   }
+  LOG("SuperVersion::~SuperVersion end");
 }
 
 SuperVersion* SuperVersion::Ref() {
@@ -468,6 +509,8 @@ void SuperVersion::Cleanup() {
     auto* memory_usage = current->cfd()->imm()->current_memory_usage();
     assert(*memory_usage >= m->ApproximateMemoryUsage());
     *memory_usage -= m->ApproximateMemoryUsage();
+    LOG("MemTableListVersion::UnrefMemTable to_delete Add M: ", m->GetID(), ' ',
+        std::hex, reinterpret_cast<void*>(m), std::dec);
     to_delete.push_back(m);
   }
   current->Unref();
@@ -541,6 +584,7 @@ ColumnFamilyData::ColumnFamilyData(
       mem_(nullptr),
       imm_(ioptions_.min_write_buffer_number_to_merge,
            ioptions_.max_write_buffer_number_to_maintain,
+           initial_cf_options_.max_local_write_buffer_number,
            ioptions_.max_write_buffer_size_to_maintain),
       super_version_(nullptr),
       super_version_number_(0),
@@ -556,7 +600,16 @@ ColumnFamilyData::ColumnFamilyData(
       last_memtable_id_(0),
       db_paths_registered_(false),
       mempurge_used_(false),
-      next_epoch_number_(1) {
+      next_epoch_number_(1),
+      meta_conn_(nullptr),
+      trans_mem_accumulated_id(0),
+      imm_que(new moodycamel::BlockingConcurrentQueue<std::pair<
+                  std::pair<MemTable*, RDMANode::rdma_connection*>,
+                  std::pair<bool,
+                            std::chrono::high_resolution_clock::time_point>>>),
+      memtable_ip_port(new std::pair<std::string, size_t>) {
+  LOG("CHECK : ", "initial_cf_options_:",
+      initial_cf_options_.server_use_remote_flush == true ? "true" : "false");
   if (id_ != kDummyColumnFamilyDataId) {
     // TODO(cc): RegisterDbPaths can be expensive, considering moving it
     // outside of this constructor which might be called with db mutex held.
@@ -646,10 +699,30 @@ ColumnFamilyData::ColumnFamilyData(
               bbto->block_cache)));
     }
   }
+  // LOG_CERR("from set pointer: ", column_family_set->get_index_cache());
+  // if (index_cache() == nullptr) {
+  //   IndexCache* index_cache = new IndexCache();
+  //   set_index_cache(index_cache);
+  //   LOG_CERR("set data index_cache: ", this->index_cache())
+  // }
+  // else {
+  //   LOG_CERR("exsited data index_cache: ", this->index_cache())
+  // }
+  // set_index_cache(column_family_set->get_index_cache());
+  set_index_cache(db_options.local_index_cache);
+  std::string memnode_ip = "10.10.1.3";
+  if (db_options.server_remote_flush ||
+      initial_cf_options_.max_local_write_buffer_number <
+          initial_cf_options_.max_write_buffer_number) {
+    if (!init_cf_level_rdma_client(memnode_ip, 9091).ok()) {
+      LOG_CERR("rdma client INIT Failed");
+    }
+  }
 }
 
 // DB mutex held
 ColumnFamilyData::~ColumnFamilyData() {
+  LOG("ColumnFamilyData: ", GetID(), "destructing");
   assert(refs_.load(std::memory_order_relaxed) == 0);
   // remove from linked list
   auto prev = prev_;
@@ -673,7 +746,6 @@ ColumnFamilyData::~ColumnFamilyData() {
   assert(!queued_for_flush_);
   assert(!queued_for_compaction_);
   assert(super_version_ == nullptr);
-
   if (dummy_versions_ != nullptr) {
     // List must be empty
     assert(dummy_versions_->Next() == dummy_versions_);
@@ -683,6 +755,7 @@ ColumnFamilyData::~ColumnFamilyData() {
   }
 
   if (mem_ != nullptr) {
+    LOG("cfd Unref Memtable");
     delete mem_->Unref();
   }
   autovector<MemTable*> to_delete;
@@ -702,6 +775,276 @@ ColumnFamilyData::~ColumnFamilyData() {
           id_, name_.c_str());
     }
   }
+
+  should_drop.store(true);
+  if (!memtable_thread.empty() && memtable_thread[0]->joinable()) {
+    for (auto thr : memtable_thread) {
+      thr->join();
+      delete thr;
+    }
+    memtable_thread.clear();
+  }
+
+  if (GetID() != kDummyColumnFamilyDataId &&
+      (ioptions_.server_remote_flush ||
+       initial_cf_options_.max_local_write_buffer_number <
+           initial_cf_options_.max_write_buffer_number)) {
+    for (size_t i = 0; i < 8; i++) {
+      RDMANode::rdma_connection* conn = nullptr;
+      delegated_read_conns_.wait_dequeue_timed(conn, std::chrono::seconds(2));
+      if (conn) {
+        cflevel_read_client_->disconnect_request(conn);
+        LOG_CERR("delegated read conn disconnect for cfd: ", GetID());
+      } else {
+        LOG_CERR("delegated read conn disconnect timeout");
+        i--;
+        continue;
+      }
+    }
+  }
+  if (cflevel_read_client_) delete cflevel_read_client_;
+
+  while (!memtable_conn_.empty()) {
+    memtable_conn_mtx_.lock();
+    auto conn = memtable_conn_.front();
+    memtable_conn_.pop();
+    cflevel_client_->disconnect_request(conn);
+    memtable_conn_mtx_.unlock();
+  }
+
+  if (gc_thread_) {
+    gc_thread_->join();
+    delete gc_thread_;
+    gc_thread_ = nullptr;
+  }
+  if (gc_conn_) {
+    cflevel_client_->disconnect_request(gc_conn_);
+  }
+  if (meta_conn_) {
+    cflevel_client_->disconnect_request(meta_conn_);
+  }
+  if (reginfo_) delete reginfo_;
+  if (imm_que != nullptr) {
+    delete imm_que;
+    imm_que = nullptr;
+  }
+  if (memtable_ip_port) delete memtable_ip_port;
+  if (cflevel_client_) delete cflevel_client_;
+}
+
+Status ColumnFamilyData::flush_imm_trans() {
+  MemTable* imm_to_trans = nullptr;
+  assert(false);
+  // while (!should_drop) {
+  //   assert(imm_que);
+  //   imm_que_mtx->lock();
+  //   if (imm_que->empty()) {
+  //     imm_que_mtx->unlock();
+  //     break;
+  //   } else {
+  //     imm_to_trans = imm_que->front();
+  //     imm_que->pop();
+  //     imm_que_mtx->unlock();
+  //   }
+  //   Status s = imm_to_trans->SendToRemote(
+  //       cflevel_client_, memtable_conn_, reginfo_->imm_meta_remote_offset,
+  //       reginfo_->imm_meta_local_offset, reginfo_->imm_data_remote_offset,
+  //       reginfo_->imm_data_local_offset, *memtable_ip_port, id_);
+  //   if (!s.ok()) {
+  //     fprintf(stderr,
+  //             "immutable memtable sent remote failed, reschedule task\n");
+  //     std::lock_guard<std::mutex> lck(*imm_que_mtx);
+  //     imm_que->push(imm_to_trans);
+  //   }
+  // }
+  return Status::OK();
+}
+
+Status ColumnFamilyData::background_schedule_imm_trans() {
+  if (!memtable_thread.empty() && memtable_thread[0]->joinable()) {
+    fprintf(stderr, "memtable thread already created\n");
+    return Status::Aborted();
+  }
+  memtable_thread.resize(4);
+  for (int i = 0; i < 4; i++) {
+    memtable_thread[i] = new std::thread([this, i]() {
+      while (!should_drop.load()) {
+        std::pair<
+            std::pair<MemTable*, RDMANode::rdma_connection*>,
+            std::pair<bool, std::chrono::high_resolution_clock::time_point>>
+            imm_to_trans = {{nullptr, nullptr}, {false, {}}};
+        assert(imm_que);
+        imm_que->wait_dequeue_timed(imm_to_trans, std::chrono::seconds(5));
+        if (imm_to_trans.first.first == nullptr && should_drop.load())
+          break;
+        else if (imm_to_trans.first.first == nullptr && !should_drop)
+          continue;
+        std::chrono::high_resolution_clock::time_point t1 =
+            std::chrono::high_resolution_clock::now();
+        LOG_CERR("Pop ImmMemTable ", imm_to_trans.first.first->GetID(),
+                 " from imm_que, takes ",
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     t1 - imm_to_trans.second.second)
+                     .count(),
+                 " ms");
+        auto reg_ = reginfo_;
+        LOG_CERR("db_impl local cache: ", index_cache_);
+        Status s = imm_to_trans.first.first->SendToRemote(
+            cflevel_client_, imm_to_trans.first.second,
+            reginfo_->index_mp.at(imm_to_trans.first.second).first,
+            reginfo_->index_mp.at(imm_to_trans.first.second).second,
+            *memtable_ip_port, id_, &gc_queue_, imm_to_trans.second.first, index_cache_);
+        if (!s.ok()) {
+          LOG_CERR("immutable memtable ", imm_to_trans.first.first->GetID(),
+                   " sent remote failed, reschedule task");
+          // std::lock_guard<std::mutex> lck(*imm_que_mtx);
+          imm_que->enqueue(imm_to_trans);
+        } else {
+          // note: be able to delete local memtable copy.
+          uint64_t new_id = imm_to_trans.first.first->GetID();
+          uint64_t old = trans_mem_accumulated_id.load();
+          while (new_id > old &&
+                 !trans_mem_accumulated_id.compare_exchange_weak(old, new_id)) {
+          }
+          // update_index_cache(imm_to_trans.first.first);
+          delete imm_to_trans.first.first->Unref();
+          {
+            std::lock_guard<std::mutex> lck(memtable_conn_mtx_);
+            memtable_conn_.push(imm_to_trans.first.second);
+          }
+          std::chrono::high_resolution_clock::time_point t2 =
+              std::chrono::high_resolution_clock::now();
+          LOG_CERR(
+              "Sending ImmMemTable ", imm_to_trans.first.first->GetID(),
+              " to remote finished, takes ",
+              std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1)
+                  .count(),
+              " ms");
+        }
+      }
+    });
+  }
+  return Status::OK();
+}
+
+void ColumnFamilyData::free_remote() {
+  if (internal_stats_ != nullptr) {
+    internal_stats_.reset();
+  }
+  free(current_);
+  const_cast<ImmutableOptions*>(&ioptions_)->~ImmutableOptions();
+  const_cast<ColumnFamilyOptions*>(&initial_cf_options_)
+      ->~ColumnFamilyOptions();
+  const_cast<MutableCFOptions*>(&mutable_cf_options_)->~MutableCFOptions();
+}
+
+void ColumnFamilyData::PackRemote(TransferService* node) const {
+  LOG("ColumnFamilyData::PackRemote");
+  assert(internal_stats_ != nullptr);
+  // internal_stats_->PackRemote(node);
+  LOG("ColumnFamilyData::PackRemote done.");
+}
+void ColumnFamilyData::UnPackRemote(TransferService* node) {
+  LOG("ColumnFamilyData::UnPackRemote");
+  // internal_stats_->UnPackRemote(node);
+  LOG("ColumnFamilyData::UnPackRemote done.");
+}
+
+void ColumnFamilyData::DoubleCheck(TransferService* node) const {
+  LOG_CERR("DoubleCheck ColumnFamilyData::current_ ptr=",
+           reinterpret_cast<void*>(current_));
+  current_->DoubleCheck(node);
+  LOG_CERR("DoubleCheck ColumnFamilyData::internal_stats_ ptr=",
+           (internal_stats_ == nullptr ? "nullptr" : "non-nullptr"));
+  internal_stats_->DoubleCheck(node);
+}
+
+void ColumnFamilyData::PackLocal(TransferService* node,
+                                 InstrumentedMutex* db_mutex) const {
+  assert(internal_comparator_.user_comparator() ==
+         initial_cf_options_.comparator);
+  initial_cf_options_.PackLocal(node);
+  ioptions_.PackLocal(node);
+  mutable_cf_options_.PackLocal(node);
+  // int_tbl_prop_collector_factories_.PackLocal(sockfd);
+  size_t int_tbl_prop_collector_factories_size =
+      int_tbl_prop_collector_factories_.size();
+  node->send(
+      reinterpret_cast<const void*>(&int_tbl_prop_collector_factories_size),
+      sizeof(size_t));
+  LOG("server check int_tbl_prop_collector_factories_: ");
+  for (auto& factory : int_tbl_prop_collector_factories_) {
+    factory->PackLocal(node);
+  }
+  LOG("server check int_tbl_prop_collector_factories_ done.");
+
+  size_t ret_val = name_.size();
+  node->send(reinterpret_cast<const void*>(&ret_val), sizeof(size_t));
+  node->send(reinterpret_cast<const void*>(name_.data()), name_.size());
+
+  db_mutex->Lock();
+  current_->PackLocal(node);
+  assert(current_->cfd() == this);
+  node->send(reinterpret_cast<const void*>(this), sizeof(ColumnFamilyData));
+}
+
+void* ColumnFamilyData::UnPackLocal(TransferService* node) {
+  void* mem = malloc(sizeof(ColumnFamilyData));
+  auto* worker_initial_cf_options_ = reinterpret_cast<ColumnFamilyOptions*>(
+      ColumnFamilyOptions::UnPackLocal(node));
+  auto* worker_ioptions_ = reinterpret_cast<ImmutableOptions*>(
+      ImmutableOptions::UnPackLocal(node, *worker_initial_cf_options_));
+  auto* worker_mutable_cf_options_ =
+      reinterpret_cast<MutableCFOptions*>(MutableCFOptions::UnPackLocal(node));
+  size_t int_tbl_prop_collector_factories_size = 0;
+  node->receive(&int_tbl_prop_collector_factories_size, sizeof(size_t));
+  std::vector<IntTblPropCollectorFactory*> temp_factories;
+  for (size_t i = 0; i < int_tbl_prop_collector_factories_size; i++) {
+    auto* int_tbl_prop_factory = reinterpret_cast<IntTblPropCollectorFactory*>(
+        IntTblPropCollectorPackFactory::UnPackLocal(node));
+    temp_factories.emplace_back(int_tbl_prop_factory);
+  }
+  size_t ret_val = 0;
+  node->receive(&ret_val, sizeof(size_t));
+  std::string worker_name_;
+  worker_name_.resize(ret_val);
+  node->receive(worker_name_.data(), ret_val);
+
+  auto* worker_current_ =
+      reinterpret_cast<Version*>(Version::UnPackLocal(node, mem));
+  node->receive(mem, sizeof(ColumnFamilyData));
+  auto* worker_cfd_ = reinterpret_cast<ColumnFamilyData*>(mem);
+  new (const_cast<ColumnFamilyOptions*>(&worker_cfd_->initial_cf_options_))
+      ColumnFamilyOptions(*worker_initial_cf_options_);
+  new (const_cast<ImmutableOptions*>(&worker_cfd_->ioptions_))
+      ImmutableOptions(*worker_ioptions_);
+  delete reinterpret_cast<ImmutableOptions*>(worker_ioptions_);
+  new (&worker_cfd_->mutable_cf_options_)
+      MutableCFOptions(*worker_mutable_cf_options_);
+  delete worker_mutable_cf_options_;
+  LOG("retrieve Comparator:");
+  auto worker_internal_comparator_ =
+      new InternalKeyComparator(worker_cfd_->initial_cf_options_.comparator);
+  new (&worker_cfd_->name_) std::string(worker_name_);
+  memcpy(const_cast<void*>(
+             reinterpret_cast<const void*>(&worker_cfd_->internal_comparator_)),
+         reinterpret_cast<void*>(worker_internal_comparator_),
+         sizeof(InternalKeyComparator));
+  delete worker_internal_comparator_;
+  delete reinterpret_cast<ColumnFamilyOptions*>(worker_initial_cf_options_);
+  new (&worker_cfd_->int_tbl_prop_collector_factories_)
+      std::vector<std::unique_ptr<IntTblPropCollectorPackFactory>>();
+  worker_cfd_->int_tbl_prop_collector_factories_.resize(temp_factories.size());
+  for (auto factory : temp_factories) {
+    worker_cfd_->int_tbl_prop_collector_factories_.emplace_back(
+        std::unique_ptr<IntTblPropCollectorFactory>(factory));
+  }
+  new (&worker_cfd_->internal_stats_)
+      std::unique_ptr<InternalStats>(std::make_unique<InternalStats>(
+          worker_cfd_->ioptions_.num_levels, worker_cfd_->ioptions_.clock,
+          worker_cfd_));
+  worker_cfd_->current_ = worker_current_;
+  return mem;
 }
 
 bool ColumnFamilyData::UnrefAndTryDelete() {
@@ -788,28 +1131,29 @@ std::unique_ptr<WriteControllerToken> SetupDelay(
   } else if (write_controller->NeedsDelay() && max_write_rate > kMinWriteRate) {
     // If user gives rate less than kMinWriteRate, don't adjust it.
     //
-    // If already delayed, need to adjust based on previous compaction debt.
-    // When there are two or more column families require delay, we always
-    // increase or reduce write rate based on information for one single
-    // column family. It is likely to be OK but we can improve if there is a
-    // problem.
-    // Ignore compaction_needed_bytes = 0 case because compaction_needed_bytes
-    // is only available in level-based compaction
+    // If already delayed, need to adjust based on previous compaction
+    // debt. When there are two or more column families require delay, we
+    // always increase or reduce write rate based on information for one
+    // single column family. It is likely to be OK but we can improve if
+    // there is a problem. Ignore compaction_needed_bytes = 0 case
+    // because compaction_needed_bytes is only available in level-based
+    // compaction
     //
-    // If the compaction debt stays the same as previously, we also further slow
-    // down. It usually means a mem table is full. It's mainly for the case
-    // where both of flush and compaction are much slower than the speed we
-    // insert to mem tables, so we need to actively slow down before we get
-    // feedback signal from compaction and flushes to avoid the full stop
-    // because of hitting the max write buffer number.
+    // If the compaction debt stays the same as previously, we also
+    // further slow down. It usually means a mem table is full. It's
+    // mainly for the case where both of flush and compaction are much
+    // slower than the speed we insert to mem tables, so we need to
+    // actively slow down before we get feedback signal from compaction
+    // and flushes to avoid the full stop because of hitting the max
+    // write buffer number.
     //
-    // If DB just falled into the stop condition, we need to further reduce
-    // the write rate to avoid the stop condition.
+    // If DB just falled into the stop condition, we need to further
+    // reduce the write rate to avoid the stop condition.
     if (penalize_stop) {
-      // Penalize the near stop or stop condition by more aggressive slowdown.
-      // This is to provide the long term slowdown increase signal.
-      // The penalty is more than the reward of recovering to the normal
-      // condition.
+      // Penalize the near stop or stop condition by more aggressive
+      // slowdown. This is to provide the long term slowdown increase
+      // signal. The penalty is more than the reward of recovering to the
+      // normal condition.
       write_rate = static_cast<uint64_t>(static_cast<double>(write_rate) *
                                          kNearStopSlowdownRatio);
       if (write_rate < kMinWriteRate) {
@@ -824,8 +1168,8 @@ std::unique_ptr<WriteControllerToken> SetupDelay(
       }
     } else if (prev_compaction_need_bytes > compaction_needed_bytes) {
       // We are speeding up by ratio of kSlowdownRatio when we have paid
-      // compaction debt. But we'll never speed up to faster than the write rate
-      // given by users.
+      // compaction debt. But we'll never speed up to faster than the
+      // write rate given by users.
       write_rate = static_cast<uint64_t>(static_cast<double>(write_rate) *
                                          kDecSlowdownRatio);
       if (write_rate > max_write_rate) {
@@ -995,9 +1339,9 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
                      write_controller->delayed_write_rate());
     } else if (write_stall_condition == WriteStallCondition::kDelayed &&
                write_stall_cause == WriteStallCause::kPendingCompactionBytes) {
-      // If the distance to hard limit is less than 1/4 of the gap between soft
-      // and
-      // hard bytes limit, we think it is near stop and speed up the slowdown.
+      // If the distance to hard limit is less than 1/4 of the gap
+      // between soft and hard bytes limit, we think it is near stop and
+      // speed up the slowdown.
       bool near_stop =
           mutable_cf_options.hard_pending_compaction_bytes_limit > 0 &&
           (compaction_needed_bytes -
@@ -1027,41 +1371,41 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
               mutable_cf_options.level0_slowdown_writes_trigger)) {
         write_controller_token_ =
             write_controller->GetCompactionPressureToken();
-        ROCKS_LOG_INFO(
-            ioptions_.logger,
-            "[%s] Increasing compaction threads because we have %d level-0 "
-            "files ",
-            name_.c_str(), vstorage->l0_delay_trigger_count());
+        ROCKS_LOG_INFO(ioptions_.logger,
+                       "[%s] Increasing compaction threads because we "
+                       "have %d level-0 "
+                       "files ",
+                       name_.c_str(), vstorage->l0_delay_trigger_count());
       } else if (vstorage->estimated_compaction_needed_bytes() >=
                  mutable_cf_options.soft_pending_compaction_bytes_limit / 4) {
-        // Increase compaction threads if bytes needed for compaction exceeds
-        // 1/4 of threshold for slowing down.
-        // If soft pending compaction byte limit is not set, always speed up
-        // compaction.
+        // Increase compaction threads if bytes needed for compaction
+        // exceeds 1/4 of threshold for slowing down. If soft pending
+        // compaction byte limit is not set, always speed up compaction.
         write_controller_token_ =
             write_controller->GetCompactionPressureToken();
         if (mutable_cf_options.soft_pending_compaction_bytes_limit > 0) {
-          ROCKS_LOG_INFO(
-              ioptions_.logger,
-              "[%s] Increasing compaction threads because of estimated pending "
-              "compaction "
-              "bytes %" PRIu64,
-              name_.c_str(), vstorage->estimated_compaction_needed_bytes());
+          ROCKS_LOG_INFO(ioptions_.logger,
+                         "[%s] Increasing compaction threads because of "
+                         "estimated pending "
+                         "compaction "
+                         "bytes %" PRIu64,
+                         name_.c_str(),
+                         vstorage->estimated_compaction_needed_bytes());
         }
       } else {
         write_controller_token_.reset();
       }
-      // If the DB recovers from delay conditions, we reward with reducing
-      // double the slowdown ratio. This is to balance the long term slowdown
-      // increase signal.
+      // If the DB recovers from delay conditions, we reward with
+      // reducing double the slowdown ratio. This is to balance the long
+      // term slowdown increase signal.
       if (needed_delay) {
         uint64_t write_rate = write_controller->delayed_write_rate();
         write_controller->set_delayed_write_rate(static_cast<uint64_t>(
             static_cast<double>(write_rate) * kDelayRecoverSlowdownRatio));
         // Set the low pri limit to be 1/4 the delayed write rate.
-        // Note we don't reset this value even after delay condition is relased.
-        // Low-pri rate will continue to apply if there is a compaction
-        // pressure.
+        // Note we don't reset this value even after delay condition is
+        // relased. Low-pri rate will continue to apply if there is a
+        // compaction pressure.
         write_controller->low_pri_rate_limiter()->SetBytesPerSecond(write_rate /
                                                                     4);
       }
@@ -1097,8 +1441,24 @@ uint64_t ColumnFamilyData::GetLiveSstFilesSize() const {
 
 MemTable* ColumnFamilyData::ConstructNewMemtable(
     const MutableCFOptions& mutable_cf_options, SequenceNumber earliest_seq) {
-  return new MemTable(internal_comparator_, ioptions_, mutable_cf_options,
-                      write_buffer_manager_, earliest_seq, id_);
+  assert(!memtable_conn_.empty() ||
+         !initial_cf_options_.server_use_remote_flush);
+  RDMANode::rdma_connection* conn_ = nullptr;
+  if (initial_cf_options_.server_use_remote_flush ||
+      initial_cf_options_.max_write_buffer_number >
+          initial_cf_options_.max_local_write_buffer_number) {
+    std::lock_guard<std::mutex> memconn_lock(memtable_conn_mtx_);
+    conn_ = memtable_conn_.front();
+    memtable_conn_.pop();
+  }
+  // fetch a non-nullptr connection from memtable_conn_ atomically
+  auto* memtable_ = new MemTable(internal_comparator_, ioptions_,
+                                 mutable_cf_options, write_buffer_manager_,
+                                 earliest_seq, id_, cflevel_client_, conn_);
+  LOG("ColumnFamilyData::ConstructNewMemtable Alloc memtable finish: "
+      "ptr =",
+      static_cast<void*>(memtable_), ' ', memtable_->GetID());
+  return memtable_;
 }
 
 void ColumnFamilyData::CreateNewMemtable(
@@ -1106,7 +1466,8 @@ void ColumnFamilyData::CreateNewMemtable(
   if (mem_ != nullptr) {
     delete mem_->Unref();
   }
-  SetMemtable(ConstructNewMemtable(mutable_cf_options, earliest_seq));
+  MemTable* ptr = ConstructNewMemtable(mutable_cf_options, earliest_seq);
+  SetMemtable(ptr);
   mem_->Ref();
 }
 
@@ -1215,27 +1576,29 @@ SuperVersion* ColumnFamilyData::GetReferencedSuperVersion(DBImpl* db) {
   SuperVersion* sv = GetThreadLocalSuperVersion(db);
   sv->Ref();
   if (!ReturnThreadLocalSuperVersion(sv)) {
-    // This Unref() corresponds to the Ref() in GetThreadLocalSuperVersion()
-    // when the thread-local pointer was populated. So, the Ref() earlier in
-    // this function still prevents the returned SuperVersion* from being
-    // deleted out from under the caller.
+    // This Unref() corresponds to the Ref() in
+    // GetThreadLocalSuperVersion() when the thread-local pointer was
+    // populated. So, the Ref() earlier in this function still prevents
+    // the returned SuperVersion* from being deleted out from under the
+    // caller.
     sv->Unref();
   }
   return sv;
 }
 
 SuperVersion* ColumnFamilyData::GetThreadLocalSuperVersion(DBImpl* db) {
-  // The SuperVersion is cached in thread local storage to avoid acquiring
-  // mutex when SuperVersion does not change since the last use. When a new
-  // SuperVersion is installed, the compaction or flush thread cleans up
-  // cached SuperVersion in all existing thread local storage. To avoid
-  // acquiring mutex for this operation, we use atomic Swap() on the thread
-  // local pointer to guarantee exclusive access. If the thread local pointer
-  // is being used while a new SuperVersion is installed, the cached
-  // SuperVersion can become stale. In that case, the background thread would
-  // have swapped in kSVObsolete. We re-check the value at when returning
-  // SuperVersion back to thread local, with an atomic compare and swap.
-  // The superversion will need to be released if detected to be stale.
+  // The SuperVersion is cached in thread local storage to avoid
+  // acquiring mutex when SuperVersion does not change since the last
+  // use. When a new SuperVersion is installed, the compaction or flush
+  // thread cleans up cached SuperVersion in all existing thread local
+  // storage. To avoid acquiring mutex for this operation, we use atomic
+  // Swap() on the thread local pointer to guarantee exclusive access. If
+  // the thread local pointer is being used while a new SuperVersion is
+  // installed, the cached SuperVersion can become stale. In that case,
+  // the background thread would have swapped in kSVObsolete. We re-check
+  // the value at when returning SuperVersion back to thread local, with
+  // an atomic compare and swap. The superversion will need to be
+  // released if detected to be stale.
   void* ptr = local_sv_->Swap(SuperVersion::kSVInUse);
   // Invariant:
   // (1) Scrape (always) installs kSVObsolete in ThreadLocal storage
@@ -1252,8 +1615,8 @@ SuperVersion* ColumnFamilyData::GetThreadLocalSuperVersion(DBImpl* db) {
     if (sv && sv->Unref()) {
       RecordTick(ioptions_.stats, NUMBER_SUPERVERSION_CLEANUPS);
       db->mutex()->Lock();
-      // NOTE: underlying resources held by superversion (sst files) might
-      // not be released until the next background job.
+      // NOTE: underlying resources held by superversion (sst files)
+      // might not be released until the next background job.
       sv->Cleanup();
       if (db->immutable_db_options().avoid_unnecessary_blocking_io) {
         db->AddSuperVersionsToFreeQueue(sv);
@@ -1283,9 +1646,10 @@ bool ColumnFamilyData::ReturnThreadLocalSuperVersion(SuperVersion* sv) {
     // SuperVersion is still current.
     return true;
   } else {
-    // ThreadLocal scrape happened in the process of this GetImpl call (after
-    // thread local Swap() at the beginning and before CompareAndSwap()).
-    // This means the SuperVersion it holds is obsolete.
+    // ThreadLocal scrape happened in the process of this GetImpl call
+    // (after thread local Swap() at the beginning and before
+    // CompareAndSwap()). This means the SuperVersion it holds is
+    // obsolete.
     assert(expected == SuperVersion::kSVObsolete);
   }
   return false;
@@ -1310,9 +1674,9 @@ void ColumnFamilyData::InstallSuperVersion(
   if (old_superversion == nullptr || old_superversion->current != current() ||
       old_superversion->mem != mem_ ||
       old_superversion->imm != imm_.current()) {
-    // Should not recalculate slow down condition if nothing has changed, since
-    // currently RecalculateWriteStallConditions() treats it as further slowing
-    // down is needed.
+    // Should not recalculate slow down condition if nothing has changed,
+    // since currently RecalculateWriteStallConditions() treats it as
+    // further slowing down is needed.
     super_version_->write_stall_condition =
         RecalculateWriteStallConditions(mutable_cf_options);
   } else {
@@ -1321,9 +1685,10 @@ void ColumnFamilyData::InstallSuperVersion(
   }
   if (old_superversion != nullptr) {
     // Reset SuperVersions cached in thread local storage.
-    // This should be done before old_superversion->Unref(). That's to ensure
-    // that local_sv_ never holds the last reference to SuperVersion, since
-    // it has no means to safely do SuperVersion cleanup.
+    // This should be done before old_superversion->Unref(). That's to
+    // ensure that local_sv_ never holds the last reference to
+    // SuperVersion, since it has no means to safely do SuperVersion
+    // cleanup.
     ResetThreadLocalSuperVersions();
 
     if (old_superversion->mutable_cf_options.write_buffer_size !=
@@ -1371,7 +1736,8 @@ Status ColumnFamilyData::ValidateOptions(
   if (s.ok() && db_options.unordered_write &&
       cf_options.max_successive_merges != 0) {
     s = Status::InvalidArgument(
-        "max_successive_merges > 0 is incompatible with unordered_write");
+        "max_successive_merges > 0 is incompatible with "
+        "unordered_write");
   }
   if (s.ok()) {
     s = CheckCFPathsSupported(db_options, cf_options);
@@ -1402,13 +1768,15 @@ Status ColumnFamilyData::ValidateOptions(
     if (cf_options.blob_garbage_collection_age_cutoff < 0.0 ||
         cf_options.blob_garbage_collection_age_cutoff > 1.0) {
       return Status::InvalidArgument(
-          "The age cutoff for blob garbage collection should be in the range "
+          "The age cutoff for blob garbage collection should be in the "
+          "range "
           "[0.0, 1.0].");
     }
     if (cf_options.blob_garbage_collection_force_threshold < 0.0 ||
         cf_options.blob_garbage_collection_force_threshold > 1.0) {
       return Status::InvalidArgument(
-          "The garbage ratio threshold for forcing blob garbage collection "
+          "The garbage ratio threshold for forcing blob garbage "
+          "collection "
           "should be in the range [0.0, 1.0].");
     }
   }
@@ -1424,7 +1792,8 @@ Status ColumnFamilyData::ValidateOptions(
                 cf_options.memtable_protection_bytes_per_key) ==
       supported.end()) {
     return Status::NotSupported(
-        "Memtable per key-value checksum protection only supports 0, 1, 2, 4 "
+        "Memtable per key-value checksum protection only supports 0, 1, "
+        "2, 4 "
         "or 8 bytes per key.");
   }
   return s;
@@ -1457,14 +1826,15 @@ Env::WriteLifeTimeHint ColumnFamilyData::CalculateSSTWriteHint(int level) {
   if (level == 0) {
     return Env::WLTH_MEDIUM;
   }
+  LOG("[error] unchecked branch");
   int base_level = current_->storage_info()->base_level();
 
   // L1: medium, L2: long, ...
   if (level - base_level >= 2) {
     return Env::WLTH_EXTREME;
   } else if (level < base_level) {
-    // There is no restriction which prevents level passed in to be smaller
-    // than base_level.
+    // There is no restriction which prevents level passed in to be
+    // smaller than base_level.
     return Env::WLTH_MEDIUM;
   }
   return static_cast<Env::WriteLifeTimeHint>(
@@ -1513,6 +1883,161 @@ void ColumnFamilyData::RecoverEpochNumbers() {
   vstorage->RecoverEpochNumbers(this);
 }
 
+Status ColumnFamilyData::init_cf_level_rdma_client(std::string& ip, int port) {
+  if (cflevel_client_ != nullptr ||
+      ColumnFamilyData::kDummyColumnFamilyDataId == GetID()) {
+    LOG_CERR("already init cfd or dummy cfd: ", GetID());
+    return Status::OK();
+  } else {
+    LOG_CERR("init cfd: ", GetID());
+  }
+  Status s = Status::OK();
+  cflevel_client_ = new RDMAClient();
+  // index_cache_ = new IndexCache(10000000, 0);
+  LOG_CERR("cfd cache: ", index_cache_);
+  reginfo_ = new struct built_memreg_info;
+  memtable_ip_port->first = ip;
+  memtable_ip_port->second = port;
+
+  cflevel_read_client_ = new RDMAReadClient();
+
+  size_t block_size_ =
+      Arena::OptimizeBlockSize((mutable_cf_options_.write_buffer_size + 10240));
+  // memory for each column family
+  size_t maintain_mr_size =
+      (100 /*memtable index*/ + (block_size_ << 3) /*memtable meta and data*/ +
+       1000 /*read request*/) *
+      initial_cf_options_.max_write_buffer_number;
+  size_t maintain_rr_size = (cflevel_read_client_->config.max_recv_wr +
+                             cflevel_read_client_->config.max_recv_wr + 100) *
+                            (sizeof(imm_read_req_v2) + sizeof(imm_read_ret));
+  cflevel_client_->resources_create(maintain_mr_size);
+  cflevel_client_->rdma_mem_.init(maintain_mr_size);
+  cflevel_read_client_->resources_create(maintain_rr_size);
+  cflevel_read_client_->rdma_mem_.init(maintain_rr_size);
+
+  for (size_t i = 0; i < 8; i++) {
+    auto conn = cflevel_read_client_->sock_connect(ip, port);
+    if (conn == nullptr) {
+      fprintf(stderr, "delegated_read_conns_ connect failed\n");
+      s = Status::IOError("delegated_read_conns_ connect failed");
+      return s;
+    }
+    ASSERT_RW(cflevel_read_client_->register_client_in_get_service_request(
+        conn, true));
+    delegated_read_conns_.enqueue(conn);
+    LOG_CERR("delegated_read_conns_ register_client_in_get_service_request: ",
+             i);
+  }
+
+  meta_conn_ = cflevel_client_->sock_connect(ip, port);
+  if (meta_conn_ == nullptr) {
+    fprintf(stderr, "meta_conn_ connect failed\n");
+    s = Status::IOError("meta_conn_ connect failed");
+    return s;
+  }
+
+  gc_conn_ = cflevel_client_->sock_connect(ip, port);
+  if (gc_conn_ == nullptr) {
+    fprintf(stderr, "gc_conn_ connect failed\n");
+    s = Status::IOError("gc_conn_ connect failed");
+    return s;
+  }
+  if (gc_thread_ == nullptr) {
+    gc_thread_ = new std::thread([this]() {
+      while (!gc_queue_.empty()) {
+        gc_queue_.pop();
+      }
+
+      while (!should_drop.load()) {
+        while (!gc_queue_.empty()) {
+          auto req = gc_queue_.front();
+          gc_queue_.pop();
+          while (Env::Default()->NowMicros() - req.second <= 1000000) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+          }
+          char req_type = 7;
+          ASSERT_RW(writen(gc_conn_->sock, &req_type, sizeof(char)) ==
+                    sizeof(char));
+          ASSERT_RW(writen(gc_conn_->sock, &req.first, sizeof(uint64_t)) ==
+                    sizeof(uint64_t));
+          char ret = 0;
+          ASSERT_RW(readn(gc_conn_->sock, &ret, sizeof(char)) == sizeof(char));
+          assert(ret == 1 || ret == 2);
+        }
+      }
+    });
+  }
+  // allocate mem for meta
+  char req_type = 9;
+  ASSERT_RW(writen(meta_conn_.load()->sock, reinterpret_cast<void*>(&req_type),
+                   sizeof(char)) == sizeof(char));
+  auto meta_offset = cflevel_client_->rdma_mem_.allocate(98304);
+  auto remote_meta_reg =
+      cflevel_client_->allocate_mem_request(meta_conn_, 98304);
+  reginfo_->rf_meta_local_offset = meta_offset;
+  reginfo_->rf_meta_remote_offset.first = remote_meta_reg.first;
+  reginfo_->rf_meta_remote_offset.second = remote_meta_reg.second;
+
+  for (int i = 0; i < initial_cf_options_.max_write_buffer_number; i++) {
+    auto conn_ = cflevel_client_->sock_connect(ip, port);
+    if (conn_ == nullptr) {
+      fprintf(stderr, "memtable_conn_ connect failed\n");
+      s = Status::IOError("memtable_conn_ connect failed");
+      return s;
+    }
+    auto local_index_offset = cflevel_client_->rdma_mem_.allocate(93);
+    char req_type = 1;
+    ASSERT_RW(writen(conn_->sock, reinterpret_cast<void*>(&req_type),
+                     sizeof(char)) == sizeof(char));
+    auto reg = cflevel_client_->allocate_mem_request(
+        conn_, 93);  // reusable index buffer
+    reginfo_->index_mp.insert({conn_, {local_index_offset, reg}});
+    memtable_conn_.push(conn_);
+  }
+
+  // auto memtable_index_offset =
+  //     cflevel_client_->rdma_mem_.allocate(93);  // imm index metadata
+  // auto memtable_meta_offset =
+  //     cflevel_client_->rdma_mem_.allocate(block_size_);  // imm table
+  //     metadata
+  // std::vector<int> memtable_data_offset;
+  // for (int i = 0; i < 4 /*sep*/; i++) {
+  //   memtable_data_offset.push_back(
+  //       cflevel_client_->rdma_mem_.allocate(block_size_));  // imm table data
+  // }
+
+  // auto remote_memindex_reg =
+  //     cflevel_client_->allocate_mem_request(memtable_conn_, 93);
+  // // reginfo_->imm_meta_remote_offset.first = remote_memmeta_reg.first;
+  // // reginfo_->imm_meta_remote_offset.second = remote_memmeta_reg.second;
+  // reginfo_->imm_index_meta_local_offset = memtable_index_offset;
+  // reginfo_->imm_index_meta_remote_offset.first = remote_memindex_reg.first;
+  // reginfo_->imm_index_meta_remote_offset.second = remote_memindex_reg.second;
+  // auto remote_memmeta_reg =
+  //     cflevel_client_->allocate_mem_request(memtable_conn_, block_size_);
+  // reginfo_->imm_meta_data_local_offset = memtable_meta_offset;
+  // reginfo_->imm_meta_data_remote_offset.first = remote_memmeta_reg.first;
+  // reginfo_->imm_meta_data_remote_offset.second = remote_memmeta_reg.second;
+
+  // for (int i = 0; i < 4 /*sep*/; i++) {
+  //   auto remote_memdata_reg =
+  //       cflevel_client_->allocate_mem_request(memtable_conn_, block_size_);
+  //   reginfo_->imm_shard_data_local_offset.push_back(memtable_data_offset[i]);
+  //   reginfo_->imm_shard_data_remote_offset.push_back(remote_memdata_reg);
+  // }
+  // fprintf(stderr,
+  //         "init_cf_level_rdma_client, rmem-meta: %ld %ld %d rmem-data %ld %ld
+  //         "
+  //         "%d\n",
+  //         reginfo_->imm_meta_remote_offset.first,
+  //         reginfo_->imm_meta_remote_offset.second, memtable_meta_offset,
+  //         reginfo_->imm_data_remote_offset.first,
+  //         reginfo_->imm_data_remote_offset.second, memtable_offset);
+  if (s.ok()) s = background_schedule_imm_trans();
+  return s;
+}
+
 ColumnFamilySet::ColumnFamilySet(const std::string& dbname,
                                  const ImmutableDBOptions* db_options,
                                  const FileOptions& file_options,
@@ -1540,11 +2065,19 @@ ColumnFamilySet::ColumnFamilySet(const std::string& dbname,
       db_id_(db_id),
       db_session_id_(db_session_id) {
   // initialize linked list
+  if (db_options->server_remote_flush != 0) {
+    LOG("ColumnFamilySet: check dummy_cfd_ remote flush: true");
+    assert(dummy_cfd_->initial_cf_options().server_use_remote_flush == true);
+  } else {
+    LOG("ColumnFamilySet: check dummy_cfd_ remote flush: false");
+    assert(dummy_cfd_->initial_cf_options().server_use_remote_flush == false);
+  }
   dummy_cfd_->prev_ = dummy_cfd_;
   dummy_cfd_->next_ = dummy_cfd_;
 }
 
 ColumnFamilySet::~ColumnFamilySet() {
+  LOG("~ColumnFamilySet: delete column_family_data_");
   while (column_family_data_.size() > 0) {
     // cfd destructor will delete itself from column_family_data_
     auto cfd = column_family_data_.begin()->second;
@@ -1552,9 +2085,11 @@ ColumnFamilySet::~ColumnFamilySet() {
     last_ref = cfd->UnrefAndTryDelete();
     assert(last_ref);
   }
+  LOG("~ColumnFamilySet: delete dummy_cfd_");
   bool dummy_last_ref __attribute__((__unused__));
   dummy_last_ref = dummy_cfd_->UnrefAndTryDelete();
   assert(dummy_last_ref);
+  LOG("~ColumnFamilySet: finish");
 }
 
 ColumnFamilyData* ColumnFamilySet::GetDefault() const {
@@ -1602,10 +2137,14 @@ ColumnFamilyData* ColumnFamilySet::CreateColumnFamily(
     const std::string& name, uint32_t id, Version* dummy_versions,
     const ColumnFamilyOptions& options) {
   assert(column_families_.find(name) == column_families_.end());
-  ColumnFamilyData* new_cfd = new ColumnFamilyData(
-      id, name, dummy_versions, table_cache_, write_buffer_manager_, options,
-      *db_options_, &file_options_, this, block_cache_tracer_, io_tracer_,
-      db_id_, db_session_id_);
+  LOG("CreateColumnFamily: new cfd,check db_options: remote flush:",
+      db_options_->server_remote_flush ? "true" : "false");
+
+  ColumnFamilyData* new_cfd = nullptr;
+  new_cfd = new ColumnFamilyData(id, name, dummy_versions, table_cache_,
+                                 write_buffer_manager_, options, *db_options_,
+                                 &file_options_, this, block_cache_tracer_,
+                                 io_tracer_, db_id_, db_session_id_);
   column_families_.insert({name, id});
   column_family_data_.insert({id, new_cfd});
   max_column_family_ = std::max(max_column_family_, id);
@@ -1618,6 +2157,7 @@ ColumnFamilyData* ColumnFamilySet::CreateColumnFamily(
   if (id == 0) {
     default_cfd_cache_ = new_cfd;
   }
+  LOG("CreateColumnFamily: new cfd finish");
   return new_cfd;
 }
 

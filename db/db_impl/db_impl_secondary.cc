@@ -945,5 +945,4 @@ Status DB::OpenAndCompact(
                         output, override_options);
 }
 
-
 }  // namespace ROCKSDB_NAMESPACE

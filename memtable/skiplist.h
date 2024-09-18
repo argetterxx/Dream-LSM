@@ -38,8 +38,8 @@
 
 #include "memory/allocator.h"
 #include "port/port.h"
+#include "rocksdb/logger.hpp"
 #include "util/random.h"
-
 namespace ROCKSDB_NAMESPACE {
 
 template <typename Key, class Comparator>
@@ -205,6 +205,7 @@ struct SkipList<Key, Comparator>::Node {
 template <typename Key, class Comparator>
 typename SkipList<Key, Comparator>::Node* SkipList<Key, Comparator>::NewNode(
     const Key& key, int height) {
+  LOG("SkipList::NewNode: version. ");
   char* mem = allocator_->AllocateAligned(
       sizeof(Node) + sizeof(std::atomic<Node*>) * (height - 1));
   return new (mem) Node(key);

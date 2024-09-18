@@ -6839,6 +6839,12 @@ class OperationStageJni {
       case ROCKSDB_NAMESPACE::ThreadStatus::OperationStage::
           STAGE_MEMTABLE_INSTALL_FLUSH_RESULTS:
         return 0xA;
+      case ROCKSDB_NAMESPACE::ThreadStatus::OperationStage::
+          STAGE_REMOTE_FLUSH_RUN:
+        return 0xB;
+      case ROCKSDB_NAMESPACE::ThreadStatus::OperationStage::
+          STAGE_REMOTE_FLUSH_WRITE_L0:
+        return 0xC;
       default:
         return 0x7F;  // undefined
     }
@@ -6880,6 +6886,12 @@ class OperationStageJni {
       case 0xA:
         return ROCKSDB_NAMESPACE::ThreadStatus::OperationStage::
             STAGE_MEMTABLE_INSTALL_FLUSH_RESULTS;
+      case 0xB:
+        return ROCKSDB_NAMESPACE::ThreadStatus::OperationStage::
+            STAGE_REMOTE_FLUSH_RUN;
+      case 0xC:
+        return ROCKSDB_NAMESPACE::ThreadStatus::OperationStage::
+            STAGE_REMOTE_FLUSH_WRITE_L0;
       default:
         // undefined/default
         return ROCKSDB_NAMESPACE::ThreadStatus::OperationStage::STAGE_UNKNOWN;

@@ -7,7 +7,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -3352,4 +3351,3 @@ void TEST_SetDefaultRateLimitersClock(
                                          restore_rate_limiter_clock);
 }
 }  // namespace ROCKSDB_NAMESPACE
-

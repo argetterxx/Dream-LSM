@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "rocksdb/customizable.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -604,7 +605,129 @@ enum StatsLevel : uint8_t {
 // because RocksDB is not exception-safe. This could cause undefined behavior
 // including data loss, unreported corruption, deadlocks, and more.
 class Statistics : public Customizable {
+ private:
+  bool remote_trigger_ = false;
+  std::vector<std::pair<uint32_t, uint64_t>> remote_record_tick_;
+  std::vector<std::pair<uint32_t, uint64_t>> remote_report_time_to_histogram_;
+  std::vector<std::pair<uint32_t, uint64_t>> remote_set_ticker_count_;
+
  public:
+  void PackLocal(TransferService* node) const {
+    bool signal = true;
+    node->send(&signal, sizeof(bool));
+  }
+  static void* UnPackLocal(TransferService* node);
+  void PackRemote(TransferService* node) const {
+    bool signal = true;
+    node->send(&signal, sizeof(bool));
+    return;
+    size_t remote_record_tick_len = remote_record_tick_.size();
+    node->send(&remote_record_tick_len, sizeof(size_t));
+    LOG_CERR("remote_record_tick_len: ", remote_record_tick_len);
+    if (remote_record_tick_len > 0)
+      node->send(
+          remote_record_tick_.data(),
+          remote_record_tick_.size() * sizeof(std::pair<uint32_t, uint64_t>));
+
+    size_t remote_report_time_to_histogram_len =
+        remote_report_time_to_histogram_.size();
+    node->send(&remote_report_time_to_histogram_len, sizeof(size_t));
+    LOG_CERR("remote_report_time_to_histogram_len: ",
+             remote_report_time_to_histogram_len);
+    if (remote_report_time_to_histogram_len > 0)
+      node->send(remote_report_time_to_histogram_.data(),
+                 remote_report_time_to_histogram_.size() *
+                     sizeof(std::pair<uint32_t, uint64_t>));
+
+    size_t remote_set_ticker_count_len = remote_set_ticker_count_.size();
+    node->send(&remote_set_ticker_count_len, sizeof(size_t));
+    LOG_CERR("remote_set_ticker_count_len: ", remote_set_ticker_count_len);
+    if (remote_set_ticker_count_len > 0)
+      node->send(remote_set_ticker_count_.data(),
+                 remote_set_ticker_count_.size() *
+                     sizeof(std::pair<uint32_t, uint64_t>));
+  }
+  void UnPackRemote(TransferService* node) {
+    size_t remote_record_tick_len = 0;
+    node->receive(&remote_record_tick_len, sizeof(size_t));
+    if (remote_record_tick_len > 0) {
+      void* remote_record_tick_ptr = malloc(
+          remote_record_tick_len * sizeof(std::pair<uint32_t, uint64_t>));
+      node->receive(
+          &remote_record_tick_ptr,
+          remote_record_tick_len * sizeof(std::pair<uint32_t, uint64_t>));
+      std::vector<std::pair<uint32_t, uint64_t>> remote_record_tick_info_;
+      remote_record_tick_info_.resize(remote_record_tick_len);
+      memcpy(reinterpret_cast<void*>(remote_record_tick_info_.data()),
+             remote_record_tick_ptr,
+             remote_record_tick_len * sizeof(std::pair<uint32_t, uint64_t>));
+      for (auto& i : remote_record_tick_info_) {
+        recordTick(i.first, i.second);
+      }
+      free(remote_record_tick_ptr);
+    }
+
+    size_t remote_report_time_to_histogram_len = 0;
+    node->receive(&remote_report_time_to_histogram_len, sizeof(size_t));
+    if (remote_report_time_to_histogram_len > 0) {
+      void* remote_report_time_to_histogram_ptr =
+          malloc(remote_report_time_to_histogram_len *
+                 sizeof(std::pair<uint32_t, uint64_t>));
+      node->receive(&remote_report_time_to_histogram_ptr,
+                    remote_report_time_to_histogram_len *
+                        sizeof(std::pair<uint32_t, uint64_t>));
+      std::vector<std::pair<uint32_t, uint64_t>>
+          remote_report_time_to_histogram_info_;
+      remote_report_time_to_histogram_info_.resize(
+          remote_report_time_to_histogram_len);
+      memcpy(
+          reinterpret_cast<void*>(remote_report_time_to_histogram_info_.data()),
+          remote_report_time_to_histogram_ptr,
+          remote_report_time_to_histogram_len *
+              sizeof(std::pair<uint32_t, uint64_t>));
+      for (auto& i : remote_report_time_to_histogram_info_) {
+        recordInHistogram(i.first, i.second);
+      }
+      free(remote_report_time_to_histogram_ptr);
+    }
+
+    size_t remote_set_ticker_count_len = 0;
+    node->receive(&remote_set_ticker_count_len, sizeof(size_t));
+    if (remote_set_ticker_count_len > 0) {
+      void* remote_set_ticker_count_ptr = malloc(
+          remote_set_ticker_count_len * sizeof(std::pair<uint32_t, uint64_t>));
+      node->receive(
+          &remote_set_ticker_count_ptr,
+          remote_set_ticker_count_len * sizeof(std::pair<uint32_t, uint64_t>));
+      std::vector<std::pair<uint32_t, uint64_t>> remote_set_ticker_count_info_;
+      remote_set_ticker_count_info_.resize(remote_set_ticker_count_len);
+      memcpy(
+          reinterpret_cast<void*>(remote_set_ticker_count_info_.data()),
+          remote_set_ticker_count_ptr,
+          remote_set_ticker_count_len * sizeof(std::pair<uint32_t, uint64_t>));
+      for (auto& i : remote_set_ticker_count_info_) {
+        setTickerCount(i.first, i.second);
+      }
+      free(remote_set_ticker_count_ptr);
+    }
+  }
+  bool get_remote_trigger() { return remote_trigger_; }
+  void set_remote_trigger(bool a) {
+    remote_trigger_ = a;
+    remote_record_tick_.clear();
+    remote_report_time_to_histogram_.clear();
+    remote_set_ticker_count_.clear();
+  }
+  void record_remote_tick(uint32_t tickerType, uint64_t count = 0) {
+    remote_record_tick_.emplace_back(tickerType, count);
+  }
+  void record_remote_time_to_histogram(uint32_t histogramType, uint64_t time) {
+    remote_report_time_to_histogram_.emplace_back(histogramType, time);
+  }
+  void record_remote_set_ticker_count(uint32_t tickerType, uint64_t count) {
+    remote_set_ticker_count_.emplace_back(tickerType, count);
+  }
+
   ~Statistics() override {}
   static const char* Type() { return "Statistics"; }
   static Status CreateFromString(const ConfigOptions& opts,
@@ -622,6 +745,9 @@ class Statistics : public Customizable {
   virtual void setTickerCount(uint32_t tickerType, uint64_t count) = 0;
   virtual uint64_t getAndResetTickerCount(uint32_t tickerType) = 0;
   virtual void reportTimeToHistogram(uint32_t histogramType, uint64_t time) {
+    if (get_remote_trigger())
+      record_remote_time_to_histogram(histogramType, time);
+    LOG("DEBUG POINT:", get_remote_trigger() ? "true" : "false");
     if (get_stats_level() <= StatsLevel::kExceptTimers) {
       return;
     }

@@ -3975,7 +3975,6 @@ TEST_F(PlainTableTest, Crc32cFileChecksum) {
   EXPECT_STREQ(f.GetFileChecksum().c_str(), checksum.c_str());
 }
 
-
 TEST_F(GeneralTableTest, ApproximateOffsetOfPlain) {
   TableConstructor c(BytewiseComparator(), true /* convert_to_internal_key_ */);
   c.Add("k01", "hello");

@@ -37,6 +37,9 @@ struct TestComparator {
   using DecodedType = Key;
 
   static DecodedType decode_key(const char* b) { return Decode(b); }
+  static size_t decode_len(const char* b, size_t protection_bytes_per_key) {
+    return sizeof(Key) + protection_bytes_per_key;
+  }
 
   int operator()(const char* a, const char* b) const {
     if (Decode(a) < Decode(b)) {

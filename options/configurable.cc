@@ -233,7 +233,6 @@ Status Configurable::ParseOption(const ConfigOptions& config_options,
   }
 }
 
-
 Status ConfigurableHelper::ConfigureOptions(
     const ConfigOptions& config_options, Configurable& configurable,
     const std::unordered_map<std::string, std::string>& opts_map,

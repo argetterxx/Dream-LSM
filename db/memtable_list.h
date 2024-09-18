@@ -5,9 +5,10 @@
 //
 #pragma once
 
+#include <sys/types.h>
+
 #include <deque>
 #include <limits>
-#include <list>
 #include <set>
 #include <string>
 #include <vector>
@@ -21,6 +22,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
+#include "rocksdb/remote_flush_service.h"
 #include "rocksdb/types.h"
 #include "util/autovector.h"
 
@@ -42,10 +44,18 @@ struct FlushJobInfo;
 // (such as holding the db mutex or being on the write thread).
 class MemTableListVersion {
  public:
+  size_t imm_size() const { return memlist_.size() + memlist_history_.size(); }
+  void check_remote() {
+    LOG_CERR("memlist_::size::", memlist_.size());
+    for (auto& ptr : memlist_) {
+      LOG_CERR(ptr->IsTransferCompleted() ? "true" : "false");
+    }
+  }
   explicit MemTableListVersion(size_t* parent_memtable_list_memory_usage,
                                const MemTableListVersion& old);
   explicit MemTableListVersion(size_t* parent_memtable_list_memory_usage,
                                int max_write_buffer_number_to_maintain,
+                               int max_local_write_buffer_number_to_maintain,
                                int64_t max_write_buffer_size_to_maintain);
 
   void Ref();
@@ -62,18 +72,20 @@ class MemTableListVersion {
            MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
            const ReadOptions& read_opts, ReadCallback* callback = nullptr,
-           bool* is_blob_index = nullptr);
+           bool* is_blob_index = nullptr, RDMAReadClient* read_client = nullptr,
+           uint64_t column_family_id = 0, ColumnFamilyData* cfd_ = nullptr);
 
   bool Get(const LookupKey& key, std::string* value,
            PinnableWideColumns* columns, std::string* timestamp, Status* s,
            MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq,
            const ReadOptions& read_opts, ReadCallback* callback = nullptr,
-           bool* is_blob_index = nullptr) {
+           bool* is_blob_index = nullptr, RDMAReadClient* read_client = nullptr,
+           uint64_t column_family_id = 0, ColumnFamilyData* cfd_ = nullptr) {
     SequenceNumber seq;
     return Get(key, value, columns, timestamp, s, merge_context,
                max_covering_tombstone_seq, &seq, read_opts, callback,
-               is_blob_index);
+               is_blob_index, read_client, column_family_id, cfd_);
   }
 
   void MultiGet(const ReadOptions& read_options, MultiGetRange* range,
@@ -167,7 +179,9 @@ class MemTableListVersion {
                    SequenceNumber* max_covering_tombstone_seq,
                    SequenceNumber* seq, const ReadOptions& read_opts,
                    ReadCallback* callback = nullptr,
-                   bool* is_blob_index = nullptr);
+                   bool* is_blob_index = nullptr,
+                   RDMAReadClient* read_client = nullptr, uint64_t cfd_id = 0,
+                   ColumnFamilyData* cfd_ = nullptr);
 
   void AddMemTable(MemTable* m);
 
@@ -194,6 +208,7 @@ class MemTableListVersion {
 
   // Maximum number of MemTables to keep in memory (including both flushed
   const int max_write_buffer_number_to_maintain_;
+  const int max_local_write_buffer_number_to_maintain_;
   // Maximum size of MemTables to keep in memory (including both flushed
   // and not-yet-flushed tables).
   const int64_t max_write_buffer_size_to_maintain_;
@@ -219,13 +234,15 @@ class MemTableList {
   // A list of memtables.
   explicit MemTableList(int min_write_buffer_number_to_merge,
                         int max_write_buffer_number_to_maintain,
+                        int max_local_write_buffer_number_to_maintain,
                         int64_t max_write_buffer_size_to_maintain)
       : imm_flush_needed(false),
         imm_trim_needed(false),
         min_write_buffer_number_to_merge_(min_write_buffer_number_to_merge),
-        current_(new MemTableListVersion(&current_memory_usage_,
-                                         max_write_buffer_number_to_maintain,
-                                         max_write_buffer_size_to_maintain)),
+        current_(new MemTableListVersion(
+            &current_memory_usage_, max_write_buffer_number_to_maintain,
+            max_local_write_buffer_number_to_maintain,
+            max_write_buffer_size_to_maintain)),
         num_flush_not_started_(0),
         commit_in_progress_(false),
         flush_requested_(false),
@@ -279,11 +296,10 @@ class MemTableList {
   Status TryInstallMemtableFlushResults(
       ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
       const autovector<MemTable*>& m, LogsWithPrepTracker* prep_tracker,
-      VersionSet* vset, InstrumentedMutex* mu, uint64_t file_number,
-      autovector<MemTable*>* to_delete, FSDirectory* db_directory,
-      LogBuffer* log_buffer,
+      VersionSet* vset, InstrumentedMutex* mu, autovector<MemTable*>* to_delete,
+      FSDirectory* db_directory, LogBuffer* log_buffer,
       std::list<std::unique_ptr<FlushJobInfo>>* committed_flush_jobs_info,
-      bool write_edits = true);
+      uint64_t* file_number, bool write_edits = true);
 
   // New memtables are inserted at the front of the list.
   // Takes ownership of the referenced held on *m by the caller of Add().

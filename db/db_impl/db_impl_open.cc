@@ -6,9 +6,15 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <cassert>
+#include <chrono>
 #include <cinttypes>
+#include <cstddef>
+#include <functional>
+#include <thread>
 
 #include "db/builder.h"
+#include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/periodic_task_scheduler.h"
@@ -20,6 +26,7 @@
 #include "logging/logging.h"
 #include "monitoring/persistent_stats_history.h"
 #include "options/options_helper.h"
+#include "rocksdb/options.h"
 #include "rocksdb/table.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/sync_point.h"
@@ -518,9 +525,12 @@ Status DBImpl::Recover(
   assert(db_id_.empty());
   Status s;
   bool missing_table_file = false;
+  LOG("Versions recover");
   if (!immutable_db_options_.best_efforts_recovery) {
+    LOG("recover not best effort");
     s = versions_->Recover(column_families, read_only, &db_id_);
   } else {
+    LOG("recover best effort");
     assert(!files_in_dbname.empty());
     s = versions_->TryRecover(column_families, read_only, files_in_dbname,
                               &db_id_, &missing_table_file);
@@ -530,6 +540,7 @@ Status DBImpl::Recover(
           new ColumnFamilyMemTablesImpl(versions_->GetColumnFamilySet()));
     }
   }
+  LOG("Versions recover finish");
   if (!s.ok()) {
     return s;
   }
@@ -632,7 +643,6 @@ Status DBImpl::Recover(
   if (s.ok() && !read_only) {
     s = DeleteUnreferencedSstFiles(recovery_ctx);
   }
-
   if (immutable_db_options_.paranoid_checks && s.ok()) {
     s = CheckConsistency();
   }
@@ -646,7 +656,6 @@ Status DBImpl::Recover(
       }
     }
   }
-
   std::vector<std::string> files_in_wal_dir;
   if (s.ok()) {
     // Initial max_total_in_memory_state_ before recovery wals. Log recovery
@@ -753,6 +762,7 @@ Status DBImpl::Recover(
       std::sort(wals.begin(), wals.end());
 
       bool corrupted_wal_found = false;
+      // INSERT Memtable check
       s = RecoverLogFiles(wals, &next_sequence, read_only, &corrupted_wal_found,
                           recovery_ctx);
       if (corrupted_wal_found && recovered_seq != nullptr) {
@@ -760,6 +770,7 @@ Status DBImpl::Recover(
       }
       if (!s.ok()) {
         // Clear memtables if recovery failed
+        LOG("CreateNewMemtable");
         for (auto cfd : *versions_->GetColumnFamilySet()) {
           cfd->CreateNewMemtable(*cfd->GetLatestMutableCFOptions(),
                                  kMaxSequenceNumber);
@@ -767,7 +778,6 @@ Status DBImpl::Recover(
       }
     }
   }
-
   if (read_only) {
     // If we are opening as read-only, we need to update options_file_number_
     // to reflect the most recent OPTIONS file. It does not matter for regular
@@ -809,7 +819,7 @@ Status DBImpl::Recover(
   }
   return s;
 }
-
+// ********************************************
 Status DBImpl::PersistentStatsProcessFormatVersion() {
   mutex_.AssertHeld();
   Status s;
@@ -1054,6 +1064,7 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
                                SequenceNumber* next_sequence, bool read_only,
                                bool* corrupted_wal_found,
                                RecoveryContext* recovery_ctx) {
+  LOG("call DBImpl::RecoverLogFiles,CEHCK operations");
   struct LogReporter : public log::Reader::Reporter {
     Env* env;
     Logger* info_log;
@@ -1706,6 +1717,13 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   DBOptions db_options(options);
   ColumnFamilyOptions cf_options(options);
+  if (db_options.server_remote_flush) {
+    cf_options.server_use_remote_flush = true;
+  }
+  LOG("DB::Open server cf_option remote_flush:",
+      cf_options.server_use_remote_flush ? "true" : "false");
+  LOG("DB::Open server db_option remote_flush:",
+      db_options.server_remote_flush ? "true" : "false");
   std::vector<ColumnFamilyDescriptor> column_families;
   column_families.push_back(
       ColumnFamilyDescriptor(kDefaultColumnFamilyName, cf_options));
@@ -1875,8 +1893,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     max_write_buffer_size =
         std::max(max_write_buffer_size, cf.options.write_buffer_size);
   }
-
+  LOG("BEGIN IMPL CONSTRUCT");
   DBImpl* impl = new DBImpl(db_options, dbname, seq_per_batch, batch_per_txn);
+  LOG("FINISH IMPL CONSTRUCT");
   if (!impl->immutable_db_options_.info_log) {
     s = impl->init_logger_creation_s_;
     delete impl;
@@ -1884,6 +1903,13 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   } else {
     assert(impl->init_logger_creation_s_.ok());
   }
+
+#ifdef ROCKSDB_RDMA
+  if (s.ok()) {
+    s = impl->InitRDMAClient();
+  }
+#endif  // ROCKSDB_RDMA
+
   s = impl->env_->CreateDirIfMissing(impl->immutable_db_options_.GetWalDir());
   if (s.ok()) {
     std::vector<std::string> paths;
@@ -1922,10 +1948,12 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
 
   // Handles create_if_missing, error_if_exists
   uint64_t recovered_seq(kMaxSequenceNumber);
+  LOG("CHECK FINISH");
   s = impl->Recover(column_families, false /* read_only */,
                     false /* error_if_wal_file_exists */,
                     false /* error_if_data_exists_in_wals */, &recovered_seq,
                     &recovery_ctx);
+  LOG("Call recover finish");
   if (s.ok()) {
     uint64_t new_log_number = impl->versions_->NewFileNumber();
     log::Writer* new_log = nullptr;
@@ -1940,7 +1968,6 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       assert(impl->logs_.empty());
       impl->logs_.emplace_back(new_log_number, new_log);
     }
-
     if (s.ok()) {
       impl->alive_log_files_.push_back(
           DBImpl::LogFileNumberSize(impl->logfile_number_));
@@ -1976,15 +2003,14 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       }
     }
   }
+
   if (s.ok()) {
     s = impl->LogAndApplyForRecovery(recovery_ctx);
   }
-
   if (s.ok() && impl->immutable_db_options_.persist_stats_to_disk) {
     impl->mutex_.AssertHeld();
     s = impl->InitPersistStatsColumnFamily();
   }
-
   if (s.ok()) {
     // set column family handles
     for (auto cf : column_families) {
@@ -2013,7 +2039,6 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       }
     }
   }
-
   if (s.ok()) {
     SuperVersionContext sv_context(/* create_superversion */ true);
     for (auto cfd : *impl->versions_->GetColumnFamilySet()) {
@@ -2022,12 +2047,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     }
     sv_context.Clean();
   }
-
   if (s.ok() && impl->immutable_db_options_.persist_stats_to_disk) {
     // try to read format version
     s = impl->PersistentStatsProcessFormatVersion();
   }
-
   if (s.ok()) {
     for (auto cfd : *impl->versions_->GetColumnFamilySet()) {
       if (!cfd->mem()->IsSnapshotSupported()) {
@@ -2062,7 +2085,6 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     persist_options_status.PermitUncheckedError();
   }
   impl->mutex_.Unlock();
-
   auto sfm = static_cast<SstFileManagerImpl*>(
       impl->immutable_db_options_.sst_file_manager.get());
   if (s.ok() && sfm) {
@@ -2071,7 +2093,6 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     sfm->SetStatisticsPtr(impl->immutable_db_options_.statistics);
     ROCKS_LOG_INFO(impl->immutable_db_options_.info_log,
                    "SstFileManager instance %p", sfm);
-
     // Notify SstFileManager about all sst files that already exist in
     // db_paths[0] and cf_paths[0] when the DB is opened.
 
@@ -2099,7 +2120,6 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         known_file_sizes[name] = bmd.blob_file_size;
       }
     }
-
     std::vector<std::string> paths;
     paths.emplace_back(impl->immutable_db_options_.db_paths[0].path);
     for (auto& cf : column_families) {
@@ -2136,7 +2156,6 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         }
       }
     }
-
     // Reserve some disk buffer space. This is a heuristic - when we run out
     // of disk space, this ensures that there is atleast write_buffer_size
     // amount of free space before we resume DB writes. In low disk space
@@ -2145,7 +2164,6 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     sfm->ReserveDiskBuffer(max_write_buffer_size,
                            impl->immutable_db_options_.db_paths[0].path);
   }
-
 
   if (s.ok()) {
     ROCKS_LOG_HEADER(impl->immutable_db_options_.info_log, "DB pointer %p",
@@ -2185,6 +2203,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     delete impl;
     *dbptr = nullptr;
   }
+
   return s;
 }
 }  // namespace ROCKSDB_NAMESPACE

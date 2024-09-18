@@ -1040,7 +1040,8 @@ class DBTestBase : public testing::Test {
   // `env_do_fsync` decides whether the special Env would do real
   // fsync for files and directories. Skipping fsync can speed up
   // tests, but won't cover the exact fsync logic.
-  DBTestBase(const std::string path, bool env_do_fsync);
+  DBTestBase(const std::string path, bool env_do_fsync,
+             bool remote_enabled = false);
 
   ~DBTestBase();
 
@@ -1072,12 +1073,19 @@ class DBTestBase : public testing::Test {
   // Return the current option configuration.
   Options CurrentOptions(const anon::OptionsOverride& options_override =
                              anon::OptionsOverride()) const;
+  Options CurrentRemoteOptions(const anon::OptionsOverride& options_override =
+                                   anon::OptionsOverride()) const;
 
   Options CurrentOptions(const Options& default_options,
                          const anon::OptionsOverride& options_override =
                              anon::OptionsOverride()) const;
 
+  Options CurrentRemoteOptions(const Options& default_options,
+                               const anon::OptionsOverride& options_override =
+                                   anon::OptionsOverride()) const;
+
   Options GetDefaultOptions() const;
+  Options GetRemoteEnabledOptions() const;
 
   Options GetOptions(int option_config) const {
     return GetOptions(option_config, GetDefaultOptions());

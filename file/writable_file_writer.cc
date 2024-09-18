@@ -17,6 +17,7 @@
 #include "monitoring/iostats_context_imp.h"
 #include "port/port.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/logger.hpp"
 #include "rocksdb/system_clock.h"
 #include "test_util/sync_point.h"
 #include "util/crc32c.h"

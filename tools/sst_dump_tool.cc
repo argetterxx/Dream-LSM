@@ -579,4 +579,3 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
   }
 }
 }  // namespace ROCKSDB_NAMESPACE
-

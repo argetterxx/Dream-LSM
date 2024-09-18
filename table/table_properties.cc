@@ -5,6 +5,10 @@
 
 #include "rocksdb/table_properties.h"
 
+#include <cstddef>
+#include <cstdlib>
+#include <utility>
+
 #include "db/seqno_to_time_mapping.h"
 #include "port/malloc.h"
 #include "port/port.h"
@@ -37,6 +41,373 @@ void AppendProperty(std::string& props, const std::string& key,
   AppendProperty(props, key, std::to_string(value), prop_delim, kv_delim);
 }
 }  // namespace
+
+void TableProperties::DoubleCheck(TransferService* node) const {
+  LOG_CERR("TableProperties::DoubleCheck::orig_file_number");
+  node->send(&orig_file_number, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::data_size");
+  node->send(&data_size, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::index_size");
+  node->send(&index_size, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::index_key_is_user_key");
+  node->send(&index_key_is_user_key, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::index_value_is_delta_encoded");
+  node->send(&index_value_is_delta_encoded, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::filter_size");
+  node->send(&filter_size, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::raw_key_size");
+  node->send(&raw_key_size, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::raw_value_size");
+  node->send(&raw_value_size, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::num_data_blocks");
+  node->send(&num_data_blocks, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::num_entries");
+  node->send(&num_entries, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::num_filter_entries");
+  node->send(&num_filter_entries, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::num_deletions");
+  node->send(&num_deletions, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::num_merge_operands");
+  node->send(&num_merge_operands, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::num_range_deletions");
+  node->send(&num_range_deletions, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::format_version");
+  node->send(&format_version, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::fixed_key_len");
+  node->send(&fixed_key_len, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::column_family_id");
+  node->send(&column_family_id, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::creation_time");
+  node->send(&creation_time, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::oldest_key_time");
+  node->send(&oldest_key_time, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::file_creation_time");
+  node->send(&file_creation_time, sizeof(uint64_t));
+  LOG_CERR(
+      "TableProperties::DoubleCheck::slow_compression_estimated_data_size");
+  node->send(&slow_compression_estimated_data_size, sizeof(uint64_t));
+  LOG_CERR(
+      "TableProperties::DoubleCheck::fast_compression_estimated_data_size");
+  node->send(&fast_compression_estimated_data_size, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::seqno_to_time_mapping");
+  node->send(&external_sst_file_global_seqno_offset, sizeof(uint64_t));
+  LOG_CERR("TableProperties::DoubleCheck::db_id");
+  size_t db_id_len = db_id.size();
+  node->send(&db_id_len, sizeof(size_t));
+  if (db_id_len) node->send(db_id.c_str(), db_id_len);
+  LOG_CERR("TableProperties::DoubleCheck::db_session_id");
+  size_t db_session_id_len = db_session_id.size();
+  node->send(&db_session_id_len, sizeof(size_t));
+  if (db_session_id_len) node->send(db_session_id.c_str(), db_session_id_len);
+  LOG_CERR("TableProperties::DoubleCheck::db_host_id");
+  size_t db_host_id_len = db_host_id.size();
+  node->send(&db_host_id_len, sizeof(size_t));
+  if (db_host_id_len) node->send(db_host_id.c_str(), db_host_id_len);
+  LOG_CERR("TableProperties::DoubleCheck::column_family_name");
+  size_t column_family_name_len = column_family_name.size();
+  node->send(&column_family_name_len, sizeof(size_t));
+  if (column_family_name_len)
+    node->send(column_family_name.c_str(), column_family_name_len);
+  LOG_CERR("TableProperties::DoubleCheck::filter_policy_name");
+  size_t filter_policy_name_len = filter_policy_name.size();
+  node->send(&filter_policy_name_len, sizeof(size_t));
+  if (filter_policy_name_len)
+    node->send(filter_policy_name.c_str(), filter_policy_name_len);
+  LOG_CERR("TableProperties::DoubleCheck::comparator_name");
+  size_t comparator_name_len = comparator_name.size();
+  node->send(&comparator_name_len, sizeof(size_t));
+  if (comparator_name_len)
+    node->send(comparator_name.c_str(), comparator_name_len);
+  LOG_CERR("TableProperties::DoubleCheck::merge_operator_name");
+  size_t merge_operator_name_len = merge_operator_name.size();
+  node->send(&merge_operator_name_len, sizeof(size_t));
+  if (merge_operator_name_len)
+    node->send(merge_operator_name.c_str(), merge_operator_name_len);
+  LOG_CERR("TableProperties::DoubleCheck::prefix_extractor_name");
+  size_t prefix_extractor_name_len = prefix_extractor_name.size();
+  node->send(&prefix_extractor_name_len, sizeof(size_t));
+  if (prefix_extractor_name_len)
+    node->send(prefix_extractor_name.c_str(), prefix_extractor_name_len);
+  LOG_CERR("TableProperties::DoubleCheck::property_collectors_names");
+  size_t property_collectors_names_len = property_collectors_names.size();
+  node->send(&property_collectors_names_len, sizeof(size_t));
+  if (property_collectors_names_len)
+    node->send(property_collectors_names.c_str(),
+               property_collectors_names_len);
+  LOG_CERR("TableProperties::DoubleCheck::compression_name");
+  size_t compression_name_len = compression_name.size();
+  node->send(&compression_name_len, sizeof(size_t));
+  if (compression_name_len)
+    node->send(compression_name.c_str(), compression_name_len);
+  LOG_CERR("TableProperties::DoubleCheck::compression_options");
+  size_t compression_options_len = compression_options.size();
+  node->send(&compression_options_len, sizeof(size_t));
+  if (compression_options_len)
+    node->send(compression_options.c_str(), compression_options_len);
+  LOG_CERR("TableProperties::DoubleCheck::seqno_to_time_mapping");
+  size_t seqno_to_time_mapping_len = seqno_to_time_mapping.size();
+  node->send(&seqno_to_time_mapping_len, sizeof(size_t));
+  if (seqno_to_time_mapping_len)
+    node->send(seqno_to_time_mapping.c_str(), seqno_to_time_mapping_len);
+}
+
+void TableProperties::PackRemote(TransferService* node) const {
+  LOG("TableProperties::PackRemote");
+  node->send(reinterpret_cast<const void*>(this), sizeof(TableProperties));
+  size_t db_id_len = db_id.size();
+  node->send(&db_id_len, sizeof(size_t));
+  if (db_id_len) node->send(db_id.c_str(), db_id_len);
+
+  size_t db_session_id_len = db_session_id.size();
+  node->send(&db_session_id_len, sizeof(size_t));
+  if (db_session_id_len) node->send(db_session_id.c_str(), db_session_id_len);
+  size_t db_host_id_len = db_host_id.size();
+  node->send(&db_host_id_len, sizeof(size_t));
+  if (db_host_id_len) node->send(db_host_id.c_str(), db_host_id_len);
+  size_t column_family_name_len = column_family_name.size();
+  node->send(&column_family_name_len, sizeof(size_t));
+  if (column_family_name_len)
+    node->send(column_family_name.c_str(), column_family_name_len);
+  size_t filter_policy_name_len = filter_policy_name.size();
+  node->send(&filter_policy_name_len, sizeof(size_t));
+  if (filter_policy_name_len)
+    node->send(filter_policy_name.c_str(), filter_policy_name_len);
+  size_t comparator_name_len = comparator_name.size();
+  node->send(&comparator_name_len, sizeof(size_t));
+  if (comparator_name_len)
+    node->send(comparator_name.c_str(), comparator_name_len);
+
+  size_t merge_operator_name_len = merge_operator_name.size();
+  node->send(&merge_operator_name_len, sizeof(size_t));
+  if (merge_operator_name_len)
+    node->send(merge_operator_name.c_str(), merge_operator_name_len);
+  size_t prefix_extractor_name_len = prefix_extractor_name.size();
+  node->send(&prefix_extractor_name_len, sizeof(size_t));
+  if (prefix_extractor_name_len)
+    node->send(prefix_extractor_name.c_str(), prefix_extractor_name_len);
+  size_t property_collectors_names_len = property_collectors_names.size();
+  node->send(&property_collectors_names_len, sizeof(size_t));
+  if (property_collectors_names_len)
+    node->send(property_collectors_names.c_str(),
+               property_collectors_names_len);
+  size_t compression_name_len = compression_name.size();
+  node->send(&compression_name_len, sizeof(size_t));
+  if (compression_name_len)
+    node->send(compression_name.c_str(), compression_name_len);
+  size_t compression_options_len = compression_options.size();
+  node->send(&compression_options_len, sizeof(size_t));
+  if (compression_options_len)
+    node->send(compression_options.c_str(), compression_options_len);
+
+  size_t seqno_to_time_mapping_len = seqno_to_time_mapping.size();
+  node->send(&seqno_to_time_mapping_len, sizeof(size_t));
+  if (seqno_to_time_mapping_len)
+    node->send(seqno_to_time_mapping.c_str(), seqno_to_time_mapping_len);
+
+  size_t user_collected_properties_len = user_collected_properties.size();
+  node->send(&user_collected_properties_len, sizeof(size_t));
+  for (auto iter = user_collected_properties.begin();
+       iter != user_collected_properties.end(); ++iter) {
+    size_t key_len = iter->first.size();
+    node->send(&key_len, sizeof(size_t));
+    node->send(iter->first.c_str(), key_len);
+    size_t value_len = iter->second.size();
+    node->send(&value_len, sizeof(size_t));
+    node->send(iter->second.c_str(), value_len);
+  }
+
+  size_t readable_properties_len = readable_properties.size();
+  node->send(&readable_properties_len, sizeof(size_t));
+  for (auto iter = readable_properties.begin();
+       iter != readable_properties.end(); ++iter) {
+    size_t key_len = iter->first.size();
+    node->send(&key_len, sizeof(size_t));
+    node->send(iter->first.c_str(), key_len);
+    size_t value_len = iter->second.size();
+    node->send(&value_len, sizeof(size_t));
+    node->send(iter->second.c_str(), value_len);
+  }
+}
+
+void* TableProperties::UnPackRemote(TransferService* node) {
+  auto* ret_ptr = new TableProperties();
+  void* mem = reinterpret_cast<void*>(ret_ptr);
+
+  node->receive(mem, sizeof(TableProperties));
+  size_t db_id_len = 0;
+  node->receive(&db_id_len, sizeof(size_t));
+  if (db_id_len > 0) {
+    char* db_id = new char[db_id_len];
+    node->receive(db_id, db_id_len);
+    new (&ret_ptr->db_id) std::string(db_id, db_id_len);
+    delete[] db_id;
+  } else {
+    new (&ret_ptr->db_id) std::string();
+  }
+  size_t db_session_id_len = 0;
+  node->receive(&db_session_id_len, sizeof(size_t));
+  if (db_session_id_len > 0) {
+    char* db_session_id = new char[db_session_id_len];
+    node->receive(db_session_id, db_session_id_len);
+    new (&ret_ptr->db_session_id) std::string(db_session_id, db_session_id_len);
+    delete[] db_session_id;
+  } else {
+    new (&ret_ptr->db_session_id) std::string();
+  }
+  size_t db_host_id_len = 0;
+  node->receive(&db_host_id_len, sizeof(size_t));
+  if (db_host_id_len > 0) {
+    char* db_host_id = new char[db_host_id_len];
+    node->receive(db_host_id, db_host_id_len);
+    new (&ret_ptr->db_host_id) std::string(db_host_id, db_host_id_len);
+    delete[] db_host_id;
+  } else {
+    new (&ret_ptr->db_host_id) std::string();
+  }
+  size_t column_family_name_len = 0;
+  node->receive(&column_family_name_len, sizeof(size_t));
+  if (column_family_name_len > 0) {
+    char* column_family_name = new char[column_family_name_len];
+    node->receive(column_family_name, column_family_name_len);
+    new (&ret_ptr->column_family_name)
+        std::string(column_family_name, column_family_name_len);
+    delete[] column_family_name;
+  } else {
+    new (&ret_ptr->column_family_name) std::string();
+  }
+  size_t filter_policy_name_len = 0;
+  node->receive(&filter_policy_name_len, sizeof(size_t));
+  if (filter_policy_name_len > 0) {
+    char* filter_policy_name = new char[filter_policy_name_len];
+    node->receive(filter_policy_name, filter_policy_name_len);
+    new (&ret_ptr->filter_policy_name)
+        std::string(filter_policy_name, filter_policy_name_len);
+    delete[] filter_policy_name;
+  } else {
+    new (&ret_ptr->filter_policy_name) std::string();
+  }
+  size_t comparator_name_len = 0;
+  node->receive(&comparator_name_len, sizeof(size_t));
+  if (comparator_name_len > 0) {
+    char* comparator_name = new char[comparator_name_len];
+    node->receive(comparator_name, comparator_name_len);
+    new (&ret_ptr->comparator_name)
+        std::string(comparator_name, comparator_name_len);
+    delete[] comparator_name;
+  } else {
+    new (&ret_ptr->comparator_name) std::string();
+  }
+  size_t merge_operator_name_len = 0;
+  node->receive(&merge_operator_name_len, sizeof(size_t));
+  if (merge_operator_name_len > 0) {
+    char* merge_operator_name = new char[merge_operator_name_len];
+    node->receive(merge_operator_name, merge_operator_name_len);
+    new (&ret_ptr->merge_operator_name)
+        std::string(merge_operator_name, merge_operator_name_len);
+    delete[] merge_operator_name;
+  } else {
+    new (&ret_ptr->merge_operator_name) std::string();
+  }
+  size_t prefix_extractor_name_len = 0;
+  node->receive(&prefix_extractor_name_len, sizeof(size_t));
+  if (prefix_extractor_name_len > 0) {
+    char* prefix_extractor_name = new char[prefix_extractor_name_len];
+    node->receive(prefix_extractor_name, prefix_extractor_name_len);
+    new (&ret_ptr->prefix_extractor_name)
+        std::string(prefix_extractor_name, prefix_extractor_name_len);
+    delete[] prefix_extractor_name;
+  } else {
+    new (&ret_ptr->prefix_extractor_name) std::string();
+  }
+  size_t property_collectors_names_len = 0;
+  node->receive(&property_collectors_names_len, sizeof(size_t));
+  if (property_collectors_names_len > 0) {
+    char* property_collectors_names = new char[property_collectors_names_len];
+    node->receive(property_collectors_names, property_collectors_names_len);
+    new (&ret_ptr->property_collectors_names)
+        std::string(property_collectors_names, property_collectors_names_len);
+    delete[] property_collectors_names;
+  } else {
+    new (&ret_ptr->property_collectors_names) std::string();
+  }
+  size_t compression_name_len = 0;
+  node->receive(&compression_name_len, sizeof(size_t));
+  if (compression_name_len > 0) {
+    char* compression_name = new char[compression_name_len];
+    node->receive(compression_name, compression_name_len);
+    new (&ret_ptr->compression_name)
+        std::string(compression_name, compression_name_len);
+    delete[] compression_name;
+  } else {
+    new (&ret_ptr->compression_name) std::string();
+  }
+  size_t compression_options_len = 0;
+  node->receive(&compression_options_len, sizeof(size_t));
+  if (compression_options_len > 0) {
+    char* compression_options = new char[compression_options_len];
+    node->receive(compression_options, compression_options_len);
+    new (&ret_ptr->compression_options)
+        std::string(compression_options, compression_options_len);
+    delete[] compression_options;
+  } else {
+    new (&ret_ptr->compression_options) std::string();
+  }
+  size_t seqno_to_time_mapping_len = 0;
+  node->receive(&seqno_to_time_mapping_len, sizeof(size_t));
+  if (seqno_to_time_mapping_len > 0) {
+    char* seqno_to_time_mapping = new char[seqno_to_time_mapping_len];
+    node->receive(seqno_to_time_mapping, seqno_to_time_mapping_len);
+    new (&ret_ptr->seqno_to_time_mapping)
+        std::string(seqno_to_time_mapping, seqno_to_time_mapping_len);
+    delete[] seqno_to_time_mapping;
+  } else {
+    new (&ret_ptr->seqno_to_time_mapping) std::string();
+  }
+  size_t user_collected_properties_len = 0;
+  node->receive(&user_collected_properties_len, sizeof(size_t));
+  new (&ret_ptr->user_collected_properties)
+      std::map<std::string, std::string>();
+  new (&ret_ptr->readable_properties) std::map<std::string, std::string>();
+  LOG("TableProperties::UnPackRemote");
+  for (size_t i = 0; i < user_collected_properties_len; i++) {
+    std::string key = "";
+    std::string value = "";
+    size_t key_len = 0;
+    node->receive(&key_len, sizeof(size_t));
+    char* key_cp = new char[key_len];
+    node->receive(key_cp, key_len);
+    key = std::string(key_cp, key_len);
+    delete[] key_cp;
+    size_t value_len = 0;
+    node->receive(&value_len, sizeof(size_t));
+    char* value_cp = new char[value_len];
+    node->receive(value_cp, value_len);
+    value = std::string(value_cp, value_len);
+    delete[] value_cp;
+    ret_ptr->user_collected_properties[key] = value;
+  }
+  size_t readable_properties_len = 0;
+  node->receive(&readable_properties_len, sizeof(size_t));
+  for (size_t i = 0; i < readable_properties_len; i++) {
+    std::string key = "";
+    std::string value = "";
+    size_t key_len = 0;
+    node->receive(&key_len, sizeof(size_t));
+    char* key_cp = new char[key_len];
+    node->receive(key_cp, key_len);
+    key = std::string(key_cp, key_len);
+    delete[] key_cp;
+    size_t value_len = 0;
+    node->receive(&value_len, sizeof(size_t));
+    char* value_cp = new char[value_len];
+    node->receive(value_cp, value_len);
+    value = std::string(value_cp, value_len);
+    delete[] value_cp;
+    ret_ptr->readable_properties[key] = value;
+  }
+  LOG("TableProperties::UnPackRemote");
+  return mem;
+}
 
 std::string TableProperties::ToString(const std::string& prop_delim,
                                       const std::string& kv_delim) const {

@@ -3,8 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#include "rocksdb/options.h"
-
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -14,6 +12,7 @@
 #include "file/file_util.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
+#include "rocksdb/options.h"
 #include "rocksdb/transaction_log.h"
 #include "table/unique_id_impl.h"
 #include "util/string_util.h"
@@ -481,4 +480,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-

@@ -13,6 +13,8 @@
 #include <iterator>
 #include <string>
 
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/status.h"
 #include "rocksdb/types.h"
 
@@ -33,6 +35,10 @@ constexpr uint64_t kUnknownSeqnoTime = 0;
 // Note: the data struct is not thread safe, both read and write need to be
 //  synchronized by caller.
 class SeqnoToTimeMapping {
+ public:
+  void PackLocal(TransferService* node) const;
+  static void* UnPackLocal(TransferService* node);
+
  public:
   // Maximum number of entries can be encoded into SST. The data is delta encode
   // so the maximum data usage for each SST is < 0.3K

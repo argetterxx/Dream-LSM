@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "rocksdb/remote_flush_service.h"
 #include "rocksdb/table.h"
 #include "util/gflags_compat.h"
 #include "util/random.h"
@@ -51,6 +52,14 @@ class DbStressTablePropertiesCollector : public TablePropertiesCollector {
 // `DbStressTablePropertiesCollectorFactory`s.
 class DbStressTablePropertiesCollectorFactory
     : public TablePropertiesCollectorFactory {
+ public:
+  void PackLocal(TransferService* node) const override {
+    size_t msg_len = sizeof(size_t) + sizeof(size_t) * 2 + sizeof(double);
+    char* msg = reinterpret_cast<char*>(malloc(msg_len));
+    *reinterpret_cast<size_t*>(msg) = 1;
+    node->send(msg, msg_len);
+  }
+
  public:
   virtual TablePropertiesCollector* CreateTablePropertiesCollector(
       TablePropertiesCollectorFactory::Context /* context */) override {

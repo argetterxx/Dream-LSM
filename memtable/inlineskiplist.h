@@ -46,11 +46,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <type_traits>
 
 #include "memory/allocator.h"
+#include "memory/sep_concurrent_arena.h"
 #include "port/likely.h"
 #include "port/port.h"
+#include "rocksdb/macro.hpp"
 #include "rocksdb/slice.h"
 #include "util/coding.h"
 #include "util/random.h"
@@ -59,6 +63,163 @@ namespace ROCKSDB_NAMESPACE {
 
 template <class Comparator>
 class InlineSkipList {
+ public:
+  inline void TESTContinuous() const {
+    if (offset == 0) {
+      LOG_CERR("TESTContinue:: seems to be local version.");
+    }
+    LOG_CERR("Allocator name: ", allocator_->name(), ' ', offset, ' ',
+             int64_t(local_mem_begin_), ' ', int64_t(remote_mem_begin_));
+    for (int i = 0; i < 4; i++) {
+      LOG_CERR("shard:", i, ' ', int64_t(local_shard_[i]), ' ',
+               int64_t(remote_shard_[i]), ' ', shard_offset_[i]);
+    }
+    Node* node = head_->Next(0, offset);
+    LOG_CERR("Head:: ", int64_t(head_), ' ', int64_t(node));
+    std::function<std::string(const char*, const char*)> parse =
+        [&](const char* raw_key, const char* meta_node) {
+          // parse the key:[key_size(int64_t)|key|value_size(int64_t)|value]
+          char* buf_ = const_cast<char*>(raw_key);
+          char* node_fake_begin_ = const_cast<char*>(meta_node);
+          char* node_end_ = node_fake_begin_ + sizeof(Node);
+          uint32_t ikey_size = 0;
+          auto p = GetVarint32Ptr(buf_, buf_ + 5, &ikey_size);
+          if (p == nullptr) {
+            LOG_CERR("ikey parse error");
+          }
+          int sep =
+              SingletonV2::SingletonV2<PrefixSep<4>>::Instance().get_sep(p);
+          std::string ikey = Slice(p, ikey_size - 8).ToString(true);
+          buf_ += VarintLength(ikey_size) + ikey_size;
+          uint32_t ivalue_size = 0;
+          p = GetVarint32Ptr(buf_, buf_ + 5, &ivalue_size);
+          if (p == nullptr) {
+            LOG_CERR("ivalue parse error");
+          }
+          std::string ivalue = Slice(p, ivalue_size).ToString();
+          int64_t blocksize_ = Arena::OptimizeBlockSize((64 << 20) + 10240);
+          assert(node_end_ <= local_mem_begin_ + offset + blocksize_ &&
+                 node_fake_begin_ >= local_mem_begin_ + offset);
+          assert(buf_ <= local_shard_[sep] + shard_offset_[sep] + blocksize_ &&
+                 buf_ >= local_shard_[sep] + shard_offset_[sep]);
+          return std::string(std::to_string(ikey_size) + "+" +
+                             std::to_string(ivalue_size) + "+" + "--" +
+                             std::to_string(sep));
+        };
+    LOG_CERR("Test Iteration");
+    int cnt = 0;
+    while (node != nullptr) {
+      LOG_CERR(parse(shard_offset_[0] ? node->RKey(shard_offset_) : node->Key(),
+                     const_cast<const char*>(reinterpret_cast<char*>(node))));
+      cnt++;
+      node = node->Next(0, offset);
+    }
+    LOG_CERR("InlineSkipList TESTContinuous Iteation finish:: ", cnt);
+    // for (int i = 0; i < 4; i++) {
+    //   LOG_CERR("Test SepIterator ", i);
+    //   SepIterator sep_iter(this, i);
+    //   sep_iter.SeekToFirst();
+    //   cnt = 0;
+    //   while (sep_iter.Valid()) {
+    //     LOG_CERR(parse(sep_iter.key(),
+    //                    const_cast<const
+    //                    char*>(reinterpret_cast<char*>(node))));
+    //     sep_iter.Next();
+    //     cnt++;
+    //   }
+    //   LOG_CERR("InlineSkipList TESTContinuous SepIterator ", i,
+    //            " finish:: ", cnt);
+    // }
+  }
+
+ public:
+  inline void set_local_begin(void* local) {
+    local_mem_begin_ = const_cast<const char*>(reinterpret_cast<char*>(local));
+  }
+  inline std::pair<const char*, size_t> get_local_begin() const {
+    return std::make_pair(
+        local_mem_begin_,
+        reinterpret_cast<SepConcurrentArena*>(allocator_)->RawBlockSize());
+  }
+  inline std::pair<void*, size_t> get_remote_begin() const {
+    return std::make_pair(
+        remote_mem_begin_,
+        reinterpret_cast<SepConcurrentArena*>(allocator_)->RawBlockSize());
+  }
+  inline void set_remote_begin(void* remote) {
+    assert(remote != nullptr);
+    remote_mem_begin_ = reinterpret_cast<char*>(remote);
+    offset = reinterpret_cast<char*>(remote) - local_mem_begin_;
+  }
+  inline void set_shard_remote_begin(int sep, void* remote) {
+    assert(remote != nullptr);
+    remote_shard_[sep] = reinterpret_cast<char*>(remote);
+    shard_offset_[sep] =
+        reinterpret_cast<const char*>(remote) - local_shard_[sep];
+  }
+  inline void set_shard_remote_begin_offset(int sep, int64_t remote_offset) {
+    assert(local_shard_[sep] != nullptr);
+    remote_shard_[sep] = const_cast<char*>(local_shard_[sep]);
+    shard_offset_[sep] = remote_offset;
+        
+  }
+  inline void set_local_buf_begin(char* local) {
+    local_buf_begin_ = const_cast<const char*>(local);
+  }
+  inline void set_enable_one_side_read() {
+    enable_multi_one_side_reads_ = true;
+    LOG_CERR("set enable one side reads");
+  }
+  inline void set_rdma_conn(RDMANode::rdma_connection* conn) {
+    conn_ = conn;
+    LOG_CERR("set conns");
+  }
+  inline void set_rdma_client(RDMAClient* client){
+    client_ = client;
+    LOG_CERR("set clients");
+  }
+  inline void set_real_offset(int64_t offset) {
+    offset_ = offset;
+  }
+  inline int64_t get_real_offset() {
+    return offset_;
+  }
+
+  inline void set_shard_local_begin(int sep, void* local) {
+    local_shard_[sep] = const_cast<const char*>(reinterpret_cast<char*>(local));
+  }
+  inline void* get_shard_local_begin(int sep) {
+    return const_cast<void*>(reinterpret_cast<const void*>(local_shard_[sep]));
+  }
+  inline void* get_shard_remote_begin(int sep) {
+    return const_cast<void*>(reinterpret_cast<const void*>(remote_shard_[sep]));
+  }
+
+  // update remote metadata
+  inline int64_t get_head_offset() const {
+    return int64_t(reinterpret_cast<char*>(head_) -
+                   const_cast<char*>(local_mem_begin_) - offset);
+  }
+  inline void set_head_offset(int64_t offset) {
+    assert(remote_mem_begin_ != nullptr);
+    Node** head = const_cast<Node**>(&head_);
+    *head = reinterpret_cast<Node*>(reinterpret_cast<char*>(remote_mem_begin_) +
+                                    offset);
+  }
+  inline void set_max_height(int height) {
+    max_height_.store(height, std::memory_order_acquire);
+  }
+  inline void get_max_height(int& height) const {
+    height = max_height_.load(std::memory_order_acquire);
+  }
+  inline Status SendToRemote() const {
+    return reinterpret_cast<BasicArena*>(allocator_)->SendToRemote();
+  }
+  inline void get_remote_page_info(uint64_t* info) const {
+    return reinterpret_cast<BasicArena*>(allocator_)
+        ->get_remote_page_info(info);
+  }
+
  private:
   struct Node;
   struct Splice;
@@ -83,7 +244,8 @@ class InlineSkipList {
   // Allocates a key and a skip-list node, returning a pointer to the key
   // portion of the node.  This method is thread-safe if the allocator
   // is thread-safe.
-  char* AllocateKey(size_t key_size);
+  void AllocateKey(size_t key_size, char** ptr_buf, char** kv_buf,
+                   const char* prefix);
 
   // Allocate a splice using allocator.
   Splice* AllocateSplice();
@@ -165,6 +327,8 @@ class InlineSkipList {
     // REQUIRES: Valid()
     const char* key() const;
 
+    // unsigned char Freq();
+
     // Advances to the next position.
     // REQUIRES: Valid()
     void Next();
@@ -196,6 +360,44 @@ class InlineSkipList {
     // Intentionally copyable
   };
 
+  class SepIterator {
+   public:
+    // Initialize an iterator over the specified list.
+    // The returned iterator is not valid.
+    explicit SepIterator(const InlineSkipList* list, int sep);
+
+    // Change the underlying skiplist used for this iterator
+    // This enables us not changing the iterator without deallocating
+    // an old one and then allocating a new one
+    void SetList(const InlineSkipList* list, int sep);
+
+    // Returns true iff the iterator is positioned at a valid node.
+    bool Valid() const;
+
+    // Returns the key at the current position.
+    // REQUIRES: Valid()
+    const char* key() const;
+
+    // Advances to the next position.
+    // REQUIRES: Valid()
+    void Next();
+
+    // Position at the first entry in list.
+    // Final state of iterator is Valid() iff list is not empty.
+    void SeekToFirst();
+
+    // Position at the last entry in list.
+    // Final state of iterator is Valid() iff list is not empty.
+    void SeekToLast();
+
+   private:
+    const InlineSkipList* list_;
+    const Node* front_;
+    const Node* last_;
+    Node* node_;
+    // Intentionally copyable
+  };
+
  private:
   const uint16_t kMaxHeight_;
   const uint16_t kBranching_;
@@ -214,6 +416,19 @@ class InlineSkipList {
   // case.  It caches the prev and next found during the most recent
   // non-concurrent insertion.
   Splice* seq_splice_;
+  // remote support
+  const char* local_mem_begin_;
+  char* remote_mem_begin_{nullptr};
+  int64_t offset{0};
+  // std::vector<std::<const char*, char*, int32_t>> remote_kv_;
+  const char* local_shard_[4]{nullptr};
+  char* remote_shard_[4]{nullptr};
+  int64_t shard_offset_[4]{0};
+  const char* local_buf_begin_;
+  bool enable_multi_one_side_reads_ = false;
+  RDMANode::rdma_connection* conn_{nullptr};
+  RDMAClient* client_ = nullptr;
+  int64_t offset_{0};
 
   inline int GetMaxHeight() const {
     return max_height_.load(std::memory_order_relaxed);
@@ -221,7 +436,7 @@ class InlineSkipList {
 
   int RandomHeight();
 
-  Node* AllocateNode(size_t key_size, int height);
+  Node* AllocateNode(size_t key_size, int height, const char* prefix);
 
   bool Equal(const char* a, const char* b) const {
     return (compare_(a, b) == 0);
@@ -239,12 +454,14 @@ class InlineSkipList {
   // Returns the earliest node with a key >= key.
   // Return nullptr if there is no such node.
   Node* FindGreaterOrEqual(const char* key) const;
+  Node* FindSepGreaterOrEqual(int sep) const;
 
   // Return the latest node with a key < key.
   // Return head_ if there is no such node.
   // Fills prev[level] with pointer to previous node at "level" for every
   // level in [0..max_height_-1], if prev is non-null.
   Node* FindLessThan(const char* key, Node** prev = nullptr) const;
+  Node* FindSepLessThan(int sep) const;
 
   // Return the latest node with a key < key on bottom_level. Start searching
   // from root node on the level below top_level.
@@ -313,16 +530,57 @@ struct InlineSkipList<Comparator>::Node {
     return rv;
   }
 
-  const char* Key() const { return reinterpret_cast<const char*>(&next_[1]); }
+  const char* Key() const {
+    return *reinterpret_cast<char**>(
+        const_cast<char*>(reinterpret_cast<const char*>(&next_[1])));
+  }
+  const char* RKey(const int64_t* remote_offset) const {
+
+      return (*reinterpret_cast<char**>(
+               const_cast<char*>(reinterpret_cast<const char*>(&next_[1])))) +
+           remote_offset[*reinterpret_cast<const uint8_t*>(
+               (reinterpret_cast<const char*>(&next_[1])) + sizeof(char*))];
+
+  }
+
+  const char* RKey(const int64_t* remote_offset, RDMAClient* rdma_client, RDMANode::rdma_connection* conn, const char* local_buf_begin) const {
+    // LOG_CERR("start jump");
+      int64_t local_position = *reinterpret_cast<char**>(const_cast<char*>(reinterpret_cast<const char*>(&next_[1]))) - rdma_client->get_buf();
+      // LOG_CERR("local position: ", local_position);
+      int64_t remote_position = remote_offset[*reinterpret_cast<const uint8_t*>((reinterpret_cast<const char*>(&next_[1])) + sizeof(char*))];
+      // LOG_CERR("remote position: ", remote_position);
+      int64_t offset = local_position + remote_position;
+      // LOG_CERR("final position: ", offset);
+      // int64_t offset = (*reinterpret_cast<char**>(
+      //          const_cast<char*>(reinterpret_cast<const char*>(&next_[1])))) - rdma_client->get_buf() + remote_offset[*reinterpret_cast<const uint8_t*>(
+      //          (reinterpret_cast<const char*>(&next_[1])) + sizeof(char*))];
+      // LOG_CERR("real key offset: ", offset);
+
+      int64_t local_key_offset = rdma_client->rdma_mem_.allocate(16);
+      char* key_offset = rdma_client->get_buf() + local_key_offset;
+      rdma_client->rdma_read(conn, 16, local_key_offset, offset);
+
+      ASSERT_RW(rdma_client->poll_completion(conn) == 0);
+      // printf("Read string: %s\n", key_offset);
+      return key_offset;
+  }
 
   // Accessors/mutators for links.  Wrapped in methods so we can add
   // the appropriate barriers as necessary, and perform the necessary
   // addressing trickery for storing links below the Node in memory.
-  Node* Next(int n) {
+  Node* Next(int n, int64_t offset) {
     assert(n >= 0);
     // Use an 'acquire load' so that we observe a fully initialized
     // version of the returned Node.
-    return ((&next_[0] - n)->load(std::memory_order_acquire));
+    Node* tmp;
+    return ((offset == 0)
+                ? ((&next_[0] - n)->load(std::memory_order_acquire))
+                : (((tmp = reinterpret_cast<Node*>(reinterpret_cast<char*>(
+                         (&next_[0] - n)->load(std::memory_order_acquire)))) ==
+                            nullptr
+                        ? nullptr
+                        : reinterpret_cast<Node*>(reinterpret_cast<char*>(tmp) +
+                                                  offset))));
   }
 
   void SetNext(int n, Node* x) {
@@ -356,6 +614,8 @@ struct InlineSkipList<Comparator>::Node {
     prev->SetNext(level, this);
   }
 
+  // unsigned char frequency{0};
+
  private:
   // next_[0] is the lowest level link (level 0).  Higher levels are
   // stored _earlier_, so level 1 is at next_[-1].
@@ -383,13 +643,18 @@ inline bool InlineSkipList<Comparator>::Iterator::Valid() const {
 template <class Comparator>
 inline const char* InlineSkipList<Comparator>::Iterator::key() const {
   assert(Valid());
-  return node_->Key();
+  // return list_->remote_shard_[0] == nullptr ? node_->Key()
+  //                                           : node_->RKey(list_->shard_offset_);
+  return list_->remote_shard_[0] == nullptr ? node_->Key()
+                                          : (!list_->enable_multi_one_side_reads_
+                                              ? node_->RKey(list_->shard_offset_) 
+                                              : node_->RKey(list_->shard_offset_, list_->client_, list_->conn_, list_->local_buf_begin_));
 }
 
 template <class Comparator>
 inline void InlineSkipList<Comparator>::Iterator::Next() {
   assert(Valid());
-  node_ = node_->Next(0);
+  node_ = node_->Next(0, list_->offset);
 }
 
 template <class Comparator>
@@ -406,7 +671,13 @@ inline void InlineSkipList<Comparator>::Iterator::Prev() {
 template <class Comparator>
 inline void InlineSkipList<Comparator>::Iterator::Seek(const char* target) {
   node_ = list_->FindGreaterOrEqual(target);
+  // node_->frequency ++;
 }
+
+// template <class Comparator>
+// inline unsigned char InlineSkipList<Comparator>::Iterator::Freq() {
+//   return node_->frequency;
+// }
 
 template <class Comparator>
 inline void InlineSkipList<Comparator>::Iterator::SeekForPrev(
@@ -427,7 +698,7 @@ inline void InlineSkipList<Comparator>::Iterator::RandomSeek() {
 
 template <class Comparator>
 inline void InlineSkipList<Comparator>::Iterator::SeekToFirst() {
-  node_ = list_->head_->Next(0);
+  node_ = list_->head_->Next(0, list_->offset);
 }
 
 template <class Comparator>
@@ -436,6 +707,70 @@ inline void InlineSkipList<Comparator>::Iterator::SeekToLast() {
   if (node_ == list_->head_) {
     node_ = nullptr;
   }
+}
+
+template <class Comparator>
+inline InlineSkipList<Comparator>::SepIterator::SepIterator(
+    const InlineSkipList* list, int sep) {
+  SetList(list, sep);
+}
+
+template <class Comparator>
+inline void InlineSkipList<Comparator>::SepIterator::SetList(
+    const InlineSkipList* list, int sep) {
+  list_ = list;
+  node_ = nullptr;
+  // Todo: check corner case
+  front_ = list_->FindSepGreaterOrEqual(sep);
+  last_ = list_->FindSepLessThan(sep + 1);
+  if (front_ != list_->head_ && front_ != nullptr) {
+    const DecodedKey pkey =
+        list_->compare_.decode_key(front_->RKey(list_->shard_offset_));
+    LOG_CERR("FindLess::Front:: ", sep, ' ', pkey.ToString(true), ' ',
+             SingletonV2::SingletonV2<PrefixSep<4>>::Instance().get_sep(
+                 pkey.data()));
+  }
+  if (last_ != list_->head_ && last_ != nullptr) {
+    const DecodedKey pkey =
+        list_->compare_.decode_key(last_->RKey(list_->shard_offset_));
+    LOG_CERR("FindLess::Last:: ", sep, ' ', pkey.ToString(true), ' ',
+             SingletonV2::SingletonV2<PrefixSep<4>>::Instance().get_sep(
+                 pkey.data()));
+  }
+}
+
+template <class Comparator>
+inline bool InlineSkipList<Comparator>::SepIterator::Valid() const {
+  return node_ != nullptr && node_ != last_;
+}
+template <class Comparator>
+inline const char* InlineSkipList<Comparator>::SepIterator::key() const {
+  assert(Valid());
+  // return list_->shard_offset_[0] ? node_->RKey(list_->shard_offset_)
+  //                                : node_->Key();
+  return list_->remote_shard_[0] == nullptr ? node_->Key()
+                                        : (!list_->enable_multi_one_side_reads_
+                                            ? node_->RKey(list_->shard_offset_) 
+                                            : node_->RKey(list_->shard_offset_, list_->client_, list_->conn_, list_->local_buf_begin_));
+}
+
+template <class Comparator>
+inline void InlineSkipList<Comparator>::SepIterator::Next() {
+  assert(Valid());
+  if (node_ == last_)
+    node_ = nullptr;
+  else
+    node_ = node_->Next(0, list_->offset);
+}
+
+template <class Comparator>
+inline void InlineSkipList<Comparator>::SepIterator::SeekToFirst() {
+  node_ = const_cast<Node*>(front_);
+}
+
+template <class Comparator>
+inline void InlineSkipList<Comparator>::SepIterator::SeekToLast() {
+  node_ = const_cast<Node*>(last_);
 }
 
 template <class Comparator>
@@ -483,17 +818,34 @@ InlineSkipList<Comparator>::FindGreaterOrEqual(const char* key) const {
   Node* last_bigger = nullptr;
   const DecodedKey key_decoded = compare_.decode_key(key);
   while (true) {
-    Node* next = x->Next(level);
+    Node* next = x->Next(level, offset);
     if (next != nullptr) {
-      PREFETCH(next->Next(level), 0, 1);
+      PREFETCH(next->Next(level, offset), 0, 1);
     }
     // Make sure the lists are sorted
-    assert(x == head_ || next == nullptr || KeyIsAfterNode(next->Key(), x));
+    // assert(x == head_ || next == nullptr ||
+    //        ((remote_shard_[0] == nullptr)
+    //             ? KeyIsAfterNode(next->Key(), x)
+    //             : KeyIsAfterNode(next->RKey(shard_offset_), x)));
+    assert(x == head_ || next == nullptr ||
+       ((remote_shard_[0] == nullptr)
+            ? KeyIsAfterNode(next->Key(), x)
+            : (!enable_multi_one_side_reads_
+               ? KeyIsAfterNode(next->RKey(shard_offset_), x)
+               : KeyIsAfterNode(next->RKey(shard_offset_, client_, conn_, local_buf_begin_), x))));
     // Make sure we haven't overshot during our search
     assert(x == head_ || KeyIsAfterNode(key_decoded, x));
     int cmp = (next == nullptr || next == last_bigger)
                   ? 1
-                  : compare_(next->Key(), key_decoded);
+                  // : compare_((shard_offset_[0]) ? next->RKey(shard_offset_)
+                  //                               : next->Key(),
+                  //            key_decoded);
+                      : compare_((shard_offset_[0] == 0)
+                            ? next->Key()
+                            : (!enable_multi_one_side_reads_
+                               ? next->RKey(shard_offset_)
+                               : next->RKey(shard_offset_, client_, conn_, local_buf_begin_)),
+                         key_decoded);
     if (cmp == 0 || (cmp > 0 && level == 0)) {
       return next;
     } else if (cmp < 0) {
@@ -526,9 +878,9 @@ InlineSkipList<Comparator>::FindLessThan(const char* key, Node** prev,
   const DecodedKey key_decoded = compare_.decode_key(key);
   while (true) {
     assert(x != nullptr);
-    Node* next = x->Next(level);
+    Node* next = x->Next(level, offset);
     if (next != nullptr) {
-      PREFETCH(next->Next(level), 0, 1);
+      PREFETCH(next->Next(level, offset), 0, 1);
     }
     assert(x == head_ || next == nullptr || KeyIsAfterNode(next->Key(), x));
     assert(x == head_ || KeyIsAfterNode(key_decoded, x));
@@ -553,11 +905,109 @@ InlineSkipList<Comparator>::FindLessThan(const char* key, Node** prev,
 
 template <class Comparator>
 typename InlineSkipList<Comparator>::Node*
+InlineSkipList<Comparator>::FindSepGreaterOrEqual(int sep) const {
+  Node* x = head_;
+  int level = GetMaxHeight() - 1;
+  while (true) {
+    Node* next = x->Next(level, offset);
+    if (next == nullptr) {
+      if (level == 0) {
+        return nullptr;
+      } else {
+        // Switch to next list
+        level--;
+      }
+    } else {
+      const char* ikey = compare_
+                             .decode_key(
+                              // remote_shard_[0] == nullptr
+                              //                ? next->Key()
+                              //                : next->RKey(shard_offset_)
+                              remote_shard_[0] == nullptr
+                                                ? next->Key()
+                                                : (!enable_multi_one_side_reads_
+                                                    ? next->RKey(shard_offset_)
+                                                    : next->RKey(shard_offset_, client_, conn_, local_buf_begin_))
+                                             )
+                             .data();
+      int next_sep =
+          SingletonV2::SingletonV2<PrefixSep<4>>::Instance().get_sep(ikey);
+      if (next_sep >= sep && level == 0) {
+        return next;
+      } else if (next_sep < sep) {
+        // Keep searching in this list
+        x = next;
+      } else {
+        // Switch to next list
+        level--;
+      }
+    }
+  }
+}
+
+template <class Comparator>
+typename InlineSkipList<Comparator>::Node*
+InlineSkipList<Comparator>::FindSepLessThan(int sep) const {
+  Node* x = head_;
+  int level = GetMaxHeight() - 1;
+  while (true) {
+    Node* next = x->Next(level, offset);
+    if (next == nullptr) {
+      if (level == 0) {
+        // const DecodedKey ikey = compare_.decode_key(x->RKey(shard_offset_));
+        // LOG_CERR("Return::FindSep:: ", sep, ' ', ikey.ToString(true), ' ',
+        //          SingletonV2::SingletonV2<PrefixSep<4>>::Instance().get_sep(
+        //              ikey.data()),
+        //          ' ', x == head_ ? "true" : "false");
+        return x == head_ ? nullptr : x;
+      } else {
+        // Switch to next list
+        level--;
+      }
+    } else {
+      const char* ikey = compare_
+                             .decode_key(
+                              // remote_shard_[0] == nullptr
+                              //                ? next->Key()
+                              //                : next->RKey(shard_offset_)
+                              remote_shard_[0] == nullptr
+                                                ? next->Key()
+                                                : (!enable_multi_one_side_reads_
+                                                    ? next->RKey(shard_offset_)
+                                                    : next->RKey(shard_offset_, client_, conn_, local_buf_begin_))
+                                             )
+                             .data();
+      int next_sep =
+          SingletonV2::SingletonV2<PrefixSep<4>>::Instance().get_sep(ikey);
+      // const DecodedKey pkey = compare_.decode_key(next->RKey(shard_offset_));
+      // LOG_CERR("FindLess:: ", sep, ' ', next_sep, ' ', level, ' ',
+      //          pkey.ToString(true), ' ',
+      //          SingletonV2::SingletonV2<PrefixSep<4>>::Instance().get_sep(
+      //              pkey.data()));
+      if (level == 0 && next_sep >= sep) {
+        // const DecodedKey ikey = compare_.decode_key(x->RKey(shard_offset_));
+        // LOG_CERR("Return::FindSep::1 ", sep, ' ', ikey.ToString(true), ' ',
+        //          SingletonV2::SingletonV2<PrefixSep<4>>::Instance().get_sep(
+        //              ikey.data()));
+        return x;
+      } else if (next_sep < sep) {
+        // Keep searching in this list
+        x = next;
+      } else {
+        // Switch to next list
+        level--;
+      }
+    }
+  }
+}
+
+template <class Comparator>
+typename InlineSkipList<Comparator>::Node*
 InlineSkipList<Comparator>::FindLast() const {
   Node* x = head_;
   int level = GetMaxHeight() - 1;
   while (true) {
-    Node* next = x->Next(level);
+    Node* next = x->Next(level, offset);
     if (next == nullptr) {
       if (level == 0) {
         return x;
@@ -599,7 +1049,7 @@ InlineSkipList<Comparator>::FindRandomEntry() const {
     scan_node = x;
     while (scan_node != limit_node) {
       lvl_nodes.push_back(scan_node);
-      scan_node = scan_node->Next(level);
+      scan_node = scan_node->Next(level, offset);
     }
     uint32_t rnd_idx = rnd->Next() % lvl_nodes.size();
     x = lvl_nodes[rnd_idx];
@@ -610,7 +1060,7 @@ InlineSkipList<Comparator>::FindRandomEntry() const {
   }
   // There is a special case where x could still be the head_
   // (note that the head_ contains no key).
-  return x == head_ && head_ != nullptr ? head_->Next(0) : x;
+  return x == head_ && head_ != nullptr ? head_->Next(0, offset) : x;
 }
 
 template <class Comparator>
@@ -622,9 +1072,9 @@ uint64_t InlineSkipList<Comparator>::EstimateCount(const char* key) const {
   const DecodedKey key_decoded = compare_.decode_key(key);
   while (true) {
     assert(x == head_ || compare_(x->Key(), key_decoded) < 0);
-    Node* next = x->Next(level);
+    Node* next = x->Next(level, offset);
     if (next != nullptr) {
-      PREFETCH(next->Next(level), 0, 1);
+      PREFETCH(next->Next(level, offset), 0, 1);
     }
     if (next == nullptr || compare_(next->Key(), key_decoded) >= 0) {
       if (level == 0) {
@@ -651,9 +1101,10 @@ InlineSkipList<Comparator>::InlineSkipList(const Comparator cmp,
       kScaledInverseBranching_((Random::kMaxNext + 1) / kBranching_),
       allocator_(allocator),
       compare_(cmp),
-      head_(AllocateNode(0, max_height)),
+      head_(AllocateNode(0, max_height, nullptr)),
       max_height_(1),
-      seq_splice_(AllocateSplice()) {
+      seq_splice_(AllocateSplice()),
+      local_mem_begin_(nullptr) {
   assert(max_height > 0 && kMaxHeight_ == static_cast<uint32_t>(max_height));
   assert(branching_factor > 1 &&
          kBranching_ == static_cast<uint32_t>(branching_factor));
@@ -662,16 +1113,33 @@ InlineSkipList<Comparator>::InlineSkipList(const Comparator cmp,
   for (int i = 0; i < kMaxHeight_; ++i) {
     head_->SetNext(i, nullptr);
   }
+  local_mem_begin_ = reinterpret_cast<const char*>(
+      reinterpret_cast<SepConcurrentArena*>(allocator)->meta_begin());
+  for (int i = 0; i < 4 /*sep*/; i++) {
+    auto kv_begin_ =
+        reinterpret_cast<SepConcurrentArena*>(allocator)->kv_begin(i);
+    local_shard_[i] = reinterpret_cast<const char*>(kv_begin_);
+    remote_shard_[i] = nullptr;
+    shard_offset_[i] = 0;
+  }
 }
 
 template <class Comparator>
-char* InlineSkipList<Comparator>::AllocateKey(size_t key_size) {
-  return const_cast<char*>(AllocateNode(key_size, RandomHeight())->Key());
+void InlineSkipList<Comparator>::AllocateKey(size_t key_size, char** ptr_buf,
+                                             char** kv_buf,
+                                             const char* prefix) {
+  Node* node_buf_ = AllocateNode(key_size, RandomHeight(), prefix);
+  const char* kv_buf_ = node_buf_->Key();
+  char* ptr_buf_ =
+      reinterpret_cast<char*>(node_buf_) + sizeof(std::atomic<Node*>);
+  *ptr_buf = ptr_buf_;
+  *kv_buf = const_cast<char*>(kv_buf_);
 }
 
 template <class Comparator>
 typename InlineSkipList<Comparator>::Node*
-InlineSkipList<Comparator>::AllocateNode(size_t key_size, int height) {
+InlineSkipList<Comparator>::AllocateNode(size_t key_size, int height,
+                                         const char* prefix_) {
   auto prefix = sizeof(std::atomic<Node*>) * (height - 1);
 
   // prefix is space for the height - 1 pointers that we store before
@@ -679,7 +1147,13 @@ InlineSkipList<Comparator>::AllocateNode(size_t key_size, int height) {
   // raw + prefix, and holds the bottom-mode (level 0) skip list pointer
   // next_[0].  key_size is the bytes for the key, which comes just after
   // the Node.
-  char* raw = allocator_->AllocateAligned(prefix + sizeof(Node) + key_size);
+  // Todo(separated-skiplist): maybe need to refine allocator->Allocate()
+  // interface ; replace char* with Offset
+  char* raw = allocator_->AllocateAligned(prefix + sizeof(std::atomic<Node*>) +
+                                          sizeof(uint8_t) + sizeof(char**));
+  char* raw_kv = key_size ? reinterpret_cast<SepConcurrentArena*>(allocator_)
+                                ->AllocateKV(key_size, prefix_)
+                          : nullptr;
   Node* x = reinterpret_cast<Node*>(raw + prefix);
 
   // Once we've linked the node into the skip list we don't actually need
@@ -690,6 +1164,14 @@ InlineSkipList<Comparator>::AllocateNode(size_t key_size, int height) {
   // using the pointers at the moment, StashHeight temporarily borrow
   // storage from next_[0] for that purpose.
   x->StashHeight(height);
+  *reinterpret_cast<char**>(raw + prefix +
+                            sizeof(std::atomic<Node*>) /*Node*/) = raw_kv;
+  // Todo: check reinterpret
+  *reinterpret_cast<uint8_t*>(
+      raw + prefix + sizeof(std::atomic<Node*>) /*Node*/ + sizeof(char*)) =
+      key_size
+          ? SingletonV2::SingletonV2<PrefixSep<4>>::Instance().get_sep(prefix_)
+          : 4;
   return x;
 }
 
@@ -763,13 +1245,13 @@ void InlineSkipList<Comparator>::FindSpliceForLevel(const DecodedKey& key,
                                                     int level, Node** out_prev,
                                                     Node** out_next) {
   while (true) {
-    Node* next = before->Next(level);
+    Node* next = before->Next(level, offset);
     if (next != nullptr) {
-      PREFETCH(next->Next(level), 0, 1);
+      PREFETCH(next->Next(level, offset), 0, 1);
     }
     if (prefetch_before == true) {
       if (next != nullptr && level > 0) {
-        PREFETCH(next->Next(level - 1), 0, 1);
+        PREFETCH(next->Next(level - 1, offset), 0, 1);
       }
     }
     assert(before == head_ || next == nullptr ||
@@ -799,10 +1281,11 @@ void InlineSkipList<Comparator>::RecomputeSpliceLevels(const DecodedKey& key,
 
 template <class Comparator>
 template <bool UseCAS>
-bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
+bool InlineSkipList<Comparator>::Insert(const char* ptr, Splice* splice,
                                         bool allow_partial_splice_fix) {
-  Node* x = reinterpret_cast<Node*>(const_cast<char*>(key)) - 1;
-  const DecodedKey key_decoded = compare_.decode_key(key);
+  Node* x = reinterpret_cast<Node*>(const_cast<char*>(ptr)) - 1;
+  const char* key_ = x->Key();
+  const DecodedKey key_decoded = compare_.decode_key(key_);
   int height = x->UnstashHeight();
   assert(height >= 1 && height <= kMaxHeight_);
 
@@ -857,7 +1340,7 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
     // optimistic if the caller actually went to the work of providing
     // a Splice.
     while (recompute_height < max_height) {
-      if (splice->prev_[recompute_height]->Next(recompute_height) !=
+      if (splice->prev_[recompute_height]->Next(recompute_height, offset) !=
           splice->next_[recompute_height]) {
         // splice isn't tight at this level, there must have been some inserts
         // to this
@@ -947,7 +1430,7 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
   } else {
     for (int i = 0; i < height; ++i) {
       if (i >= recompute_height &&
-          splice->prev_[i]->Next(i) != splice->next_[i]) {
+          splice->prev_[i]->Next(i, offset) != splice->next_[i]) {
         FindSpliceForLevel<false>(key_decoded, splice->prev_[i], nullptr, i,
                                   &splice->prev_[i], &splice->next_[i]);
       }
@@ -966,7 +1449,7 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
              compare_(x->Key(), splice->next_[i]->Key()) < 0);
       assert(splice->prev_[i] == head_ ||
              compare_(splice->prev_[i]->Key(), x->Key()) < 0);
-      assert(splice->prev_[i]->Next(i) == splice->next_[i]);
+      assert(splice->prev_[i]->Next(i, offset) == splice->next_[i]);
       x->NoBarrier_SetNext(i, splice->next_[i]);
       splice->prev_[i]->SetNext(i, x);
     }
@@ -979,9 +1462,9 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
     assert(splice->next_[splice->height_] == nullptr);
     for (int i = 0; i < splice->height_; ++i) {
       assert(splice->next_[i] == nullptr ||
-             compare_(key, splice->next_[i]->Key()) < 0);
+             compare_(key_, splice->next_[i]->Key()) < 0);
       assert(splice->prev_[i] == head_ ||
-             compare_(splice->prev_[i]->Key(), key) <= 0);
+             compare_(splice->prev_[i]->Key(), key_) <= 0);
       assert(splice->prev_[i + 1] == splice->prev_[i] ||
              splice->prev_[i + 1] == head_ ||
              compare_(splice->prev_[i + 1]->Key(), splice->prev_[i]->Key()) <
@@ -1019,7 +1502,7 @@ void InlineSkipList<Comparator>::TEST_Validate() const {
     nodes[i] = head_;
   }
   while (nodes[0] != nullptr) {
-    Node* l0_next = nodes[0]->Next(0);
+    Node* l0_next = nodes[0]->Next(0, offset);
     if (l0_next == nullptr) {
       break;
     }
@@ -1028,7 +1511,7 @@ void InlineSkipList<Comparator>::TEST_Validate() const {
 
     int i = 1;
     while (i < max_height) {
-      Node* next = nodes[i]->Next(i);
+      Node* next = nodes[i]->Next(i, offset);
       if (next == nullptr) {
         break;
       }
@@ -1044,7 +1527,7 @@ void InlineSkipList<Comparator>::TEST_Validate() const {
     }
   }
   for (int i = 1; i < max_height; i++) {
-    assert(nodes[i] != nullptr && nodes[i]->Next(i) == nullptr);
+    assert(nodes[i] != nullptr && nodes[i]->Next(i, offset) == nullptr);
   }
 }
 

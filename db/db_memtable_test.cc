@@ -1,14 +1,18 @@
+
+
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
 #include "db/db_test_util.h"
 #include "db/memtable.h"
 #include "db/range_del_aggregator.h"
+#include "memory/allocator.h"
 #include "port/stack_trace.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/slice_transform.h"
@@ -25,7 +29,16 @@ class MockMemTableRep : public MemTableRep {
   explicit MockMemTableRep(Allocator* allocator, MemTableRep* rep)
       : MemTableRep(allocator), rep_(rep), num_insert_with_hint_(0) {}
 
-  KeyHandle Allocate(const size_t len, char** buf) override {
+  inline static MockMemTableRep* CreateMockMemTableRep(Allocator* allocator,
+                                                       MemTableRep* rep) {
+    assert(strcmp(allocator->name(), "ConcurrentArena") == 0);
+    auto* mem = malloc(sizeof(MockMemTableRep));
+    auto* ret = new (mem) MockMemTableRep(allocator, rep);
+    return ret;
+  }
+
+  KeyHandle Allocate(const size_t len, char** buf, char** kv_buf = nullptr,
+                     const char* prefix = nullptr) override {
     return rep_->Allocate(len, buf);
   }
 
@@ -281,6 +294,7 @@ TEST_F(DBMemTableTest, InsertWithHint) {
   Options options;
   options.allow_concurrent_memtable_write = false;
   options.create_if_missing = true;
+  // options.server_use_remote_flush = true;
   options.memtable_factory.reset(new MockMemTableRepFactory());
   options.memtable_insert_with_hint_prefix_extractor.reset(
       new TestPrefixExtractor());

@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/table.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -136,6 +138,12 @@ class TableBuilder;
 //
 //
 class PlainTableFactory : public TableFactory {
+ public:
+  void PackLocal(TransferService* node) const override {
+    size_t msg = 3;
+    node->send(&msg, sizeof(msg));
+  }
+
  public:
   ~PlainTableFactory() {}
   // user_key_len is the length of the user key. If it is set to be

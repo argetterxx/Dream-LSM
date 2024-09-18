@@ -3,15 +3,14 @@
    found in the LICENSE file. See the AUTHORS file for names of contributors. */
 // Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 
-#include <stdio.h>
+#include "rocksdb/c.h"
 
 #include <assert.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-
-#include "rocksdb/c.h"
 #ifndef OS_WIN
 #include <unistd.h>
 #endif

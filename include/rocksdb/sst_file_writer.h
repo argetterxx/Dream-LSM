@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <memory>
 #include <string>
 
@@ -175,4 +174,3 @@ class SstFileWriter {
   std::unique_ptr<Rep> rep_;
 };
 }  // namespace ROCKSDB_NAMESPACE
-

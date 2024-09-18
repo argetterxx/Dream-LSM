@@ -4,7 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 
-
 #include "rocksdb/convenience.h"
 
 #include "db/db_impl/db_impl.h"
@@ -76,4 +75,3 @@ Status VerifySstFileChecksum(const Options& options,
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

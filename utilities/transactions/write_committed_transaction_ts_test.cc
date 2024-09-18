@@ -6,9 +6,8 @@
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "rocksdb/utilities/transaction_db.h"
-#include "utilities/merge_operators.h"
-
 #include "test_util/testutil.h"
+#include "utilities/merge_operators.h"
 #include "utilities/transactions/transaction_test.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -575,4 +574,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-

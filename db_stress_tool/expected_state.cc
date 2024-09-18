@@ -326,7 +326,6 @@ bool FileExpectedStateManager::HasHistory() {
   return saved_seqno_ != kMaxSequenceNumber;
 }
 
-
 namespace {
 
 // An `ExpectedStateTraceRecordHandler` applies a configurable number of

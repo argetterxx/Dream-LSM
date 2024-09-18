@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <string>
 
 #include "rocksdb/customizable.h"
@@ -460,4 +459,3 @@ class EncryptedFileSystem : public FileSystemWrapper {
   }
 };
 }  // namespace ROCKSDB_NAMESPACE
-

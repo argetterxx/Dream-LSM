@@ -51,7 +51,10 @@ struct OperationStageInfo {
 static OperationStageInfo global_op_stage_table[] = {
     {ThreadStatus::STAGE_UNKNOWN, ""},
     {ThreadStatus::STAGE_FLUSH_RUN, "FlushJob::Run"},
+    {ThreadStatus::STAGE_REMOTE_FLUSH_RUN, "RemoteFlushJob::Run"},
     {ThreadStatus::STAGE_FLUSH_WRITE_L0, "FlushJob::WriteLevel0Table"},
+    {ThreadStatus::STAGE_REMOTE_FLUSH_WRITE_L0,
+     "RemoteFlushJob::WriteLevel0Table"},
     {ThreadStatus::STAGE_COMPACTION_PREPARE, "CompactionJob::Prepare"},
     {ThreadStatus::STAGE_COMPACTION_RUN, "CompactionJob::Run"},
     {ThreadStatus::STAGE_COMPACTION_PROCESS_KV,

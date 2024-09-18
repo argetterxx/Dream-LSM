@@ -612,6 +612,7 @@ Status Tracer::WriteFooter() {
 }
 
 Status Tracer::WriteTrace(const Trace& trace) {
+  // note: how to write trace
   std::string encoded_trace;
   TracerHelper::EncodeTrace(trace, &encoded_trace);
   return trace_writer_->Write(Slice(encoded_trace));

@@ -14,6 +14,7 @@
 
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_source.h"
+#include "db/column_family.h"
 #include "db/version_edit.h"
 #include "logging/logging.h"
 #include "monitoring/persistent_stats_history.h"
@@ -170,19 +171,29 @@ VersionEditHandler::VersionEditHandler(
 }
 
 Status VersionEditHandler::Initialize() {
+  LOG("VersionEditHandler::Initialize");
   Status s;
   if (!initialized_) {
+    LOG("VersionEditHandler::Initialize,not initialized");
     for (const auto& cf_desc : column_families_) {
       name_to_options_.emplace(cf_desc.name, cf_desc.options);
     }
+    LOG("VersionEditHandler::Initialize,check default cf");
     auto default_cf_iter = name_to_options_.find(kDefaultColumnFamilyName);
     if (default_cf_iter == name_to_options_.end()) {
       s = Status::InvalidArgument("Default column family not specified");
+    } else {
+      LOG("CHECK default cf remote_flush:",
+          default_cf_iter->second.server_use_remote_flush ? "true" : "false");
     }
     if (s.ok()) {
       VersionEdit default_cf_edit;
       default_cf_edit.AddColumnFamily(kDefaultColumnFamilyName);
       default_cf_edit.SetColumnFamily(0);
+      LOG("CHECK Init cf options: ",
+          default_cf_iter->second.server_use_remote_flush
+              ? "remote_flush triggered on"
+              : "remote flush not set");
       ColumnFamilyData* cfd =
           CreateCfAndInit(default_cf_iter->second, default_cf_edit);
       assert(cfd != nullptr);
@@ -197,6 +208,7 @@ Status VersionEditHandler::Initialize() {
 
 Status VersionEditHandler::ApplyVersionEdit(VersionEdit& edit,
                                             ColumnFamilyData** cfd) {
+  LOG("VersionEditHandler::ApplyVersionEdit")
   Status s;
   if (edit.is_column_family_add_) {
     s = OnColumnFamilyAdd(edit, cfd);
@@ -218,6 +230,7 @@ Status VersionEditHandler::ApplyVersionEdit(VersionEdit& edit,
 
 Status VersionEditHandler::OnColumnFamilyAdd(VersionEdit& edit,
                                              ColumnFamilyData** cfd) {
+  LOG("OnColumnFamilyAdd");
   bool cf_in_not_found = false;
   bool cf_in_builders = false;
   CheckColumnFamilyId(edit, &cf_in_not_found, &cf_in_builders);
@@ -480,6 +493,8 @@ void VersionEditHandler::CheckIterationResult(const log::Reader& reader,
 
 ColumnFamilyData* VersionEditHandler::CreateCfAndInit(
     const ColumnFamilyOptions& cf_options, const VersionEdit& edit) {
+  LOG("CreateCfAndInit,CHECK cf remote_flush:",
+      cf_options.server_use_remote_flush ? "true" : "false");
   ColumnFamilyData* cfd = version_set_->CreateColumnFamily(cf_options, &edit);
   assert(cfd != nullptr);
   cfd->set_initialized();
@@ -492,6 +507,7 @@ ColumnFamilyData* VersionEditHandler::CreateCfAndInit(
     cf_to_missing_blob_files_high_.emplace(edit.column_family_,
                                            kInvalidBlobFileNumber);
   }
+  LOG("CreateCfAndInit finish");
   return cfd;
 }
 

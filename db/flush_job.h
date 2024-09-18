@@ -38,6 +38,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/listener.h"
 #include "rocksdb/memtablerep.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/transaction_log.h"
 #include "table/scoped_arena_iterator.h"
 #include "util/autovector.h"
@@ -56,6 +57,9 @@ class VersionSet;
 class Arena;
 
 class FlushJob {
+ public:
+  void DoubleCheck(TransferService* node);
+
  public:
   // TODO(icanadi) make effort to reduce number of parameters here
   // IMPORTANT: mutable_cf_options needs to be alive while FlushJob is alive
@@ -99,7 +103,7 @@ class FlushJob {
   void ReportStartedFlush();
   void ReportFlushInputSize(const autovector<MemTable*>& mems);
   void RecordFlushIOStats();
-  Status WriteLevel0Table();
+  Status WriteLevel0Table(int sep);
 
   // Memtable Garbage Collection algorithm: a MemPurge takes the list
   // of immutable memtables and filters out (or "purge") the outdated bytes

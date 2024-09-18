@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 
+#include <cassert>
 #include <cinttypes>
 
 #include "db/lookup_key.h"
@@ -175,6 +176,16 @@ int InternalKeyComparator::Compare(const ParsedInternalKey& a,
   return -Compare(b, a);
 }
 
+LookupKey::LookupKey(const char* start, size_t memtable_key_len) {
+  char* data = new char[memtable_key_len];
+  start_ = data;
+  end_ = data + memtable_key_len;
+  std::memcpy(data, start, memtable_key_len);
+  uint32_t klength = 0;
+  const char* key_ptr = GetVarint32Ptr(data, data + 5, &klength);
+  kstart_ = key_ptr;
+}
+
 LookupKey::LookupKey(const Slice& _user_key, SequenceNumber s,
                      const Slice* ts) {
   size_t usize = _user_key.size();
@@ -210,4 +221,5 @@ void IterKey::EnlargeBuffer(size_t key_size) {
   buf_ = new char[key_size];
   buf_size_ = key_size;
 }
+
 }  // namespace ROCKSDB_NAMESPACE

@@ -28,6 +28,10 @@ class EmulatedSystemClock : public SystemClockWrapper {
   bool no_slowdown_;
 
  public:
+  void PackLocal(TransferService* node) const override {
+    uint8_t type = 2;
+    node->send(&type, sizeof(type));
+  }
   explicit EmulatedSystemClock(const std::shared_ptr<SystemClock>& base,
                                bool time_elapse_only_sleep = false);
 

@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <stack>
 #include <string>
 #include <vector>
@@ -379,4 +378,3 @@ class TransactionBaseImpl : public Transaction {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

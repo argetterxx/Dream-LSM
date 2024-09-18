@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 #include <errno.h>
+
 #if defined(ROCKSDB_IOURING_PRESENT)
 #include <liburing.h>
 #include <sys/uio.h>
@@ -326,6 +327,9 @@ class PosixRandomAccessFile : public FSRandomAccessFile {
 };
 
 class PosixWritableFile : public FSWritableFile {
+ private:
+  FileSystem::SlidingWindow* writeWindow_;
+
  protected:
   const std::string filename_;
   const bool use_direct_io_;
@@ -345,7 +349,8 @@ class PosixWritableFile : public FSWritableFile {
  public:
   explicit PosixWritableFile(const std::string& fname, int fd,
                              size_t logical_block_size,
-                             const EnvOptions& options);
+                             const EnvOptions& options,
+                             FileSystem::SlidingWindow* writeWindow);
   virtual ~PosixWritableFile();
 
   // Need to implement this so the file is truncated correctly

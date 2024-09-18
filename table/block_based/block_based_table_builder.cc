@@ -885,6 +885,7 @@ struct BlockBasedTableBuilder::ParallelCompressionRep {
 BlockBasedTableBuilder::BlockBasedTableBuilder(
     const BlockBasedTableOptions& table_options, const TableBuilderOptions& tbo,
     WritableFileWriter* file) {
+  LOG("BlockBasedTableBuilder::BlockBasedTableBuilder");
   BlockBasedTableOptions sanitized_table_options(table_options);
   if (sanitized_table_options.format_version == 0 &&
       sanitized_table_options.checksum != kCRC32c) {
@@ -896,7 +897,6 @@ BlockBasedTableBuilder::BlockBasedTableBuilder(
     // behavior
     sanitized_table_options.format_version = 1;
   }
-
   rep_ = new Rep(sanitized_table_options, tbo, file);
 
   TEST_SYNC_POINT_CALLBACK(
@@ -909,6 +909,7 @@ BlockBasedTableBuilder::BlockBasedTableBuilder(
   if (rep_->IsParallelCompressionEnabled()) {
     StartParallelCompression();
   }
+  LOG("BlockBasedTableBuilder::BlockBasedTableBuilder:End");
 }
 
 BlockBasedTableBuilder::~BlockBasedTableBuilder() {
@@ -1419,7 +1420,6 @@ IOStatus BlockBasedTableBuilder::io_status() const {
 Status BlockBasedTableBuilder::InsertBlockInCacheHelper(
     const Slice& block_contents, const BlockHandle* handle,
     BlockType block_type) {
-
   Cache* block_cache = rep_->table_options.block_cache.get();
   Status s;
   auto helper =

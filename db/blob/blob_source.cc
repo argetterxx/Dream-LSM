@@ -81,8 +81,8 @@ Status BlobSource::PutBlobIntoCache(
   assert(cached_blob->IsEmpty());
 
   TypedHandle* cache_handle = nullptr;
-  const Status s = InsertEntryIntoCache(cache_key, blob->get(),
-                                        &cache_handle, Cache::Priority::BOTTOM);
+  const Status s = InsertEntryIntoCache(cache_key, blob->get(), &cache_handle,
+                                        Cache::Priority::BOTTOM);
   if (s.ok()) {
     blob->release();
 

@@ -6,11 +6,16 @@
 
 #include <stdint.h>
 
+#include <cassert>
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <string>
 
 #include "rocksdb/customizable.h"
+#include "rocksdb/logger.hpp"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/status.h"
 #include "rocksdb/types.h"
 
@@ -143,6 +148,13 @@ class TablePropertiesCollector {
 // including data loss, unreported corruption, deadlocks, and more.
 class TablePropertiesCollectorFactory : public Customizable {
  public:
+  virtual void PackLocal([[maybe_unused]] TransferService* node) const {
+    LOG("TablePropertiesCollectorFactory::PackLocal not implemented. Name: ",
+        Name());
+    assert(false);
+  }
+
+ public:
   struct Context {
     uint32_t column_family_id;
     // The level at creating the SST file (i.e, table), of which the
@@ -174,6 +186,11 @@ class TablePropertiesCollectorFactory : public Customizable {
 // TableProperties contains a bunch of read-only properties of its associated
 // table.
 struct TableProperties {
+ public:
+  void DoubleCheck(TransferService* node) const;
+  void PackRemote(TransferService* node) const;
+  static void* UnPackRemote(TransferService* node);
+
  public:
   // the file number at creation time, or 0 for unknown. When known,
   // combining with db_session_id must uniquely identify an SST file.

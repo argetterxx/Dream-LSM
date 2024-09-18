@@ -1243,7 +1243,6 @@ TEST_F(CompactionPickerTest, FIFOToWarmWithHotBetweenWarms) {
   ASSERT_EQ(2U, compaction->input(0, 0)->fd.GetNumber());
 }
 
-
 TEST_F(CompactionPickerTest, CompactionPriMinOverlapping1) {
   NewVersionStorage(6, kCompactionStyleLevel);
   ioptions_.compaction_pri = kMinOverlappingRatio;
@@ -3977,7 +3976,6 @@ TEST_P(PerKeyPlacementCompactionPickerTest,
 
 INSTANTIATE_TEST_CASE_P(PerKeyPlacementCompactionPickerTest,
                         PerKeyPlacementCompactionPickerTest, ::testing::Bool());
-
 
 }  // namespace ROCKSDB_NAMESPACE
 

@@ -145,7 +145,6 @@ TEST_F(DBTest2, PartitionedIndexUserToInternalKey) {
   }
 }
 
-
 class PrefixFullBloomWithReverseComparator
     : public DBTestBase,
       public ::testing::WithParamInterface<bool> {
@@ -1986,7 +1985,6 @@ TEST_F(DBTest2, CompactionStall) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-
 TEST_F(DBTest2, FirstSnapshotTest) {
   Options options;
   options.write_buffer_size = 100000;  // Small write buffer
@@ -3609,7 +3607,6 @@ TEST_F(DBTest2, OptimizeForSmallDB) {
   value.Reset();
 }
 
-
 TEST_F(DBTest2, IterRaceFlush1) {
   ASSERT_OK(Put("foo", "v1"));
 
@@ -4075,7 +4072,6 @@ TEST_F(DBTest2, ReadCallbackTest) {
   }
 }
 
-
 TEST_F(DBTest2, LiveFilesOmitObsoleteFiles) {
   // Regression test for race condition where an obsolete file is returned to
   // user as a "live file" but then deleted, all while file deletions are
@@ -4406,7 +4402,7 @@ TEST_F(DBTest2, TraceAndReplay) {
       db2->NewDefaultReplayer(handles, std::move(trace_reader), &replayer));
 
   TraceExecutionResultHandler res_handler;
-  std::function<void(Status, std::unique_ptr<TraceRecordResult> &&)> res_cb =
+  std::function<void(Status, std::unique_ptr<TraceRecordResult>&&)> res_cb =
       [&res_handler](Status exec_s, std::unique_ptr<TraceRecordResult>&& res) {
         ASSERT_TRUE(exec_s.ok() || exec_s.IsNotSupported());
         if (res != nullptr) {
@@ -5142,7 +5138,6 @@ TEST_F(DBTest2, TraceWithFilter) {
   // 4 WRITE + HEADER + FOOTER = 6
   ASSERT_EQ(count, 6);
 }
-
 
 TEST_F(DBTest2, PinnableSliceAndMmapReads) {
   Options options = CurrentOptions();
@@ -7416,7 +7411,6 @@ TEST_F(DBTest2, RecoverEpochNumber) {
                   : 2);
   }
 }
-
 
 TEST_F(DBTest2, RenameDirectory) {
   Options options = CurrentOptions();

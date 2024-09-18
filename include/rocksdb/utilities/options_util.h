@@ -6,7 +6,6 @@
 // This file contains utility functions for RocksDB Options.
 #pragma once
 
-
 #include <string>
 #include <vector>
 
@@ -80,6 +79,12 @@ Status LoadOptionsFromFile(const ConfigOptions& config_options,
                            DBOptions* db_options,
                            std::vector<ColumnFamilyDescriptor>* cf_descs,
                            std::shared_ptr<Cache>* cache = {});
+
+Status LoadOptionsFromMem(const ConfigOptions& config_options,
+                          const std::string& options_file_name,
+                          DBOptions* db_options,
+                          std::vector<ColumnFamilyDescriptor>* cf_descs,
+                          std::shared_ptr<Cache>* cache = {});
 
 // Returns the latest options file name under the specified db path.
 Status GetLatestOptionsFileName(const std::string& dbpath, Env* env,

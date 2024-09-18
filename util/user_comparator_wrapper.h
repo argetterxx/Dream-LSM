@@ -8,8 +8,15 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 #include "monitoring/perf_context_imp.h"
 #include "rocksdb/comparator.h"
+#include "rocksdb/comparator_factory.h"
+#include "rocksdb/logger.hpp"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -17,12 +24,26 @@ namespace ROCKSDB_NAMESPACE {
 // perf_context.user_key_comparison_count.
 class UserComparatorWrapper {
  public:
+  void PackLocal(TransferService* node) const {
+    user_comparator_->PackLocal(node);
+    node->send(reinterpret_cast<const void*>(this), sizeof(*this));
+  }
+  static void* UnPackLocal(TransferService* node) {
+    void* ucmp = ComparatorFactory::UnPackLocal(node);
+    void* mem = malloc(sizeof(UserComparatorWrapper));
+    node->receive(&mem, sizeof(UserComparatorWrapper));
+    auto* ret = reinterpret_cast<UserComparatorWrapper*>(mem);
+    ret->user_comparator_ = reinterpret_cast<Comparator*>(ucmp);
+    return ret;
+  }
+
+ public:
   // `UserComparatorWrapper`s constructed with the default constructor are not
   // usable and will segfault on any attempt to use them for comparisons.
   UserComparatorWrapper() : user_comparator_(nullptr) {}
 
   explicit UserComparatorWrapper(const Comparator* const user_cmp)
-      : user_comparator_(user_cmp) {}
+      : user_comparator_(const_cast<Comparator*>(user_cmp)) {}
 
   ~UserComparatorWrapper() = default;
 

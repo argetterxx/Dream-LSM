@@ -24,7 +24,7 @@ class MemMapping {
  public:
   static constexpr bool kHugePageSupported =
 #if defined(MAP_HUGETLB) || defined(FILE_MAP_LARGE_PAGES)
-      true;
+      false;
 #else
       false;
 #endif

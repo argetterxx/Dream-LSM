@@ -7,9 +7,12 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "rocksdb/advanced_options.h"
@@ -203,7 +206,6 @@ struct WriteStallInfo {
     WriteStallCondition prev;
   } condition;
 };
-
 
 struct FileDeletionInfo {
   FileDeletionInfo() = default;
@@ -835,6 +837,5 @@ class EventListener : public Customizable {
 
   ~EventListener() override {}
 };
-
 
 }  // namespace ROCKSDB_NAMESPACE

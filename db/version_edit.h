@@ -9,6 +9,9 @@
 
 #pragma once
 #include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <set>
 #include <string>
 #include <utility>
@@ -22,6 +25,7 @@
 #include "port/malloc.h"
 #include "rocksdb/advanced_cache.h"
 #include "rocksdb/advanced_options.h"
+#include "rocksdb/remote_flush_service.h"
 #include "table/table_reader.h"
 #include "table/unique_id_impl.h"
 #include "util/autovector.h"
@@ -117,6 +121,22 @@ extern uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id);
 // The behavior is undefined when a copied of the structure is used when the
 // file is not in any live version any more.
 struct FileDescriptor {
+ public:
+  void PackRemote(TransferService* node) const { PackLocal(node); }
+  static void* UnPackRemote(TransferService* node) { return UnPackLocal(node); }
+  void PackLocal(TransferService* node) const {
+    node->send(reinterpret_cast<const void*>(this), sizeof(FileDescriptor));
+    assert(table_reader == nullptr);
+  }
+  static void* UnPackLocal(TransferService* node) {
+    void* mem = malloc(sizeof(FileDescriptor));
+    node->receive(mem, sizeof(FileDescriptor));
+    [[maybe_unused]] auto* ptr = reinterpret_cast<FileDescriptor*>(mem);
+    assert(ptr->table_reader == nullptr);
+    return mem;
+  }
+
+ public:
   // Table reader in table_reader_handle
   TableReader* table_reader;
   uint64_t packed_number_and_path_id;
@@ -171,6 +191,15 @@ struct FileSampledStats {
 };
 
 struct FileMetaData {
+ public:
+  void PackLocal(TransferService* node) const;
+  void DoubleCheck(TransferService* node) const;
+  static void* UnPackLocal(TransferService* node);
+  void PackRemote(TransferService* node) const;
+  static void* UnPackRemote(TransferService* node);
+  std::string DebugString() const;
+
+ public:
   FileDescriptor fd;
   InternalKey smallest;  // Smallest internal key served by table
   InternalKey largest;   // Largest internal key served by table
@@ -189,7 +218,7 @@ struct FileMetaData {
   uint64_t compensated_file_size = 0;
   // These values can mutate, but they can only be read or written from
   // single-threaded LogAndApply thread
-  uint64_t num_entries = 0;     // the number of entries.
+  uint64_t num_entries = 0;  // the number of entries.
   // The number of deletion entries, including range deletions.
   uint64_t num_deletions = 0;
   uint64_t raw_key_size = 0;    // total uncompressed key size.
@@ -365,6 +394,14 @@ struct LevelFilesBrief {
 // constructed by joining a sequence of Version Edits. Version Edits are written
 // to the MANIFEST file.
 class VersionEdit {
+ public:
+  void free_remote();
+  void PackRemote(TransferService* node) const;
+  void UnPackRemote(TransferService* node);
+  void PackLocal(TransferService* node) const;
+  void DoubleCheck(TransferService* node) const;
+  static void* UnPackLocal(TransferService* node, VersionEdit* = nullptr);
+
  public:
   void Clear();
 

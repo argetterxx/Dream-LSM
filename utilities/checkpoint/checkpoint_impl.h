@@ -61,4 +61,3 @@ class CheckpointImpl : public Checkpoint {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

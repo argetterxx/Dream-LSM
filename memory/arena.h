@@ -13,22 +13,32 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <deque>
 
 #include "memory/allocator.h"
 #include "port/mmap.h"
 #include "rocksdb/env.h"
+#include "rocksdb/remote_flush_service.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class Arena : public Allocator {
+class Arena : public BasicArena {
+ public:
+  void PackLocal(TransferService* node) const override;
+  static void* UnPackLocal(TransferService* node);
+  Status SendToRemote() const override;
+  void get_remote_page_info(uint64_t* info) const override;
+
  public:
   // No copying allowed
   Arena(const Arena&) = delete;
   void operator=(const Arena&) = delete;
 
-  static constexpr size_t kInlineSize = 2048;
+  const char* name() const override { return "Arena"; }
+
+  static constexpr size_t kInlineSize = 0;
   static constexpr size_t kMinBlockSize = 4096;
   static constexpr size_t kMaxBlockSize = 2u << 30;
 
@@ -40,8 +50,10 @@ class Arena : public Allocator {
   // supported hugepage size of the system), block allocation will try huge
   // page TLB first. If allocation fails, will fall back to normal case.
   explicit Arena(size_t block_size = kMinBlockSize,
-                 AllocTracker* tracker = nullptr, size_t huge_page_size = 0);
-  ~Arena();
+                 AllocTracker* tracker = nullptr, size_t huge_page_size = 0,
+                 RDMAClient* client = nullptr,
+                 RDMANode::rdma_connection* conn = nullptr);
+  ~Arena() override;
 
   char* Allocate(size_t bytes) override;
 
@@ -63,23 +75,32 @@ class Arena : public Allocator {
   // Returns an estimate of the total memory usage of data allocated
   // by the arena (exclude the space allocated but not yet used for future
   // allocations).
-  size_t ApproximateMemoryUsage() const {
+  size_t ApproximateMemoryUsage() const override {
     return blocks_memory_ + blocks_.size() * sizeof(char*) -
            alloc_bytes_remaining_;
   }
 
-  size_t MemoryAllocatedBytes() const { return blocks_memory_; }
+  size_t MemoryAllocatedBytes() const override { return blocks_memory_; }
 
-  size_t AllocatedAndUnused() const { return alloc_bytes_remaining_; }
+  size_t AllocatedAndUnused() const override { return alloc_bytes_remaining_; }
 
   // If an allocation is too big, we'll allocate an irregular block with the
   // same size of that allocation.
-  size_t IrregularBlockNum() const { return irregular_block_num; }
+  size_t IrregularBlockNum() const override { return irregular_block_num; }
 
   size_t BlockSize() const override { return kBlockSize; }
 
-  bool IsInInlineBlock() const {
+  size_t RawDataUsage() const override {
+    return kBlockSize - (aligned_alloc_ptr_ - mem_begin_) -
+           (mem_begin_ + kBlockSize - unaligned_alloc_ptr_);
+  }
+
+  bool IsInInlineBlock() const override {
     return blocks_.empty() && huge_blocks_.empty();
+  }
+
+  const void* MemBegin() const override {
+    return reinterpret_cast<const void*>(mem_begin_);
   }
 
   // check and adjust the block_size so that the return value is
@@ -104,6 +125,7 @@ class Arena : public Allocator {
   // memory from one direction.
   char* unaligned_alloc_ptr_ = nullptr;
   char* aligned_alloc_ptr_ = nullptr;
+  const char* mem_begin_;
   // How many bytes left in currently active block?
   size_t alloc_bytes_remaining_ = 0;
 
@@ -117,6 +139,9 @@ class Arena : public Allocator {
   size_t blocks_memory_ = 0;
   // Non-owned
   AllocTracker* tracker_;
+  RDMAClient* client_ = nullptr;
+  RDMANode::rdma_connection* conn_ = nullptr;
+  std::pair<int64_t, int64_t> remote_reg_mem = {0, 0};
 };
 
 inline char* Arena::Allocate(size_t bytes) {

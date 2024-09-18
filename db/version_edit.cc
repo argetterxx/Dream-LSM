@@ -9,10 +9,23 @@
 
 #include "db/version_edit.h"
 
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+#include <utility>
+
 #include "db/blob/blob_index.h"
+#include "db/dbformat.h"
 #include "db/version_set.h"
 #include "logging/event_logger.h"
+#include "rocksdb/file_checksum.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/types.h"
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/coding.h"
@@ -25,6 +38,303 @@ namespace {}  // anonymous namespace
 uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
   assert(number <= kFileNumberMask);
   return number | (path_id * (kFileNumberMask + 1));
+}
+
+std::string FileMetaData::DebugString() const {
+  std::string r;
+  r.append("\n FileMetaData #");
+  r.append("\n fd.GetNumber packed_number_and_path_id" +
+           std::to_string(fd.GetNumber()));
+  r.append("\n fd.file_size " + std::to_string(fd.file_size));
+  r.append("\n fd.smallest_seqno " + std::to_string(fd.smallest_seqno));
+  r.append("\n fd.largest_seqno " + std::to_string(fd.largest_seqno));
+  if (fd.table_reader == nullptr) {
+    r.append("\n fd.table_reader == nullptr");
+  } else {
+    r.append("\n fd.table_reader != nullptr :" +
+             fd.table_reader->GetTableProperties()->column_family_name);
+  }
+  r.append("\n smallest: " + smallest.DebugString(false));
+  r.append("\n largest: " + largest.DebugString(false));
+  if (table_reader_handle == nullptr) {
+    r.append("\n table_reader_handle==nullptr");
+  } else {
+    r.append("\n table_reader_handle!=nullptr :" +
+             std::to_string(reinterpret_cast<size_t>(table_reader_handle)));
+  }
+  r.append("\n stats: " + std::to_string(stats.num_reads_sampled.load()));
+  r.append("\n compensated_file_size: " +
+           std::to_string(compensated_file_size));
+  r.append("\n num_entries: " + std::to_string(num_entries));
+  r.append("\n num_deletions: " + std::to_string(num_deletions));
+  r.append("\n raw_key_size: " + std::to_string(raw_key_size));
+  r.append("\n raw_value_size: " + std::to_string(raw_value_size));
+  r.append("\n num_range_deletions: " + std::to_string(num_range_deletions));
+  r.append("\n compensated_range_deletion_size: " +
+           std::to_string(compensated_range_deletion_size));
+  r.append("\n refs: " + std::to_string(refs));
+  if (being_compacted) {
+    r.append("\n being_compacted: true");
+  } else {
+    r.append("\n being_compacted: false");
+  }
+  if (init_stats_from_file) {
+    r.append("\n init_stats_from_file: true");
+  } else {
+    r.append("\n init_stats_from_file: false");
+  }
+  if (marked_for_compaction) {
+    r.append("\n marked_for_compaction: true");
+  } else {
+    r.append("\n marked_for_compaction: false");
+  }
+  r.append("\n temperature: " + std::to_string((size_t)temperature));
+  r.append("\n oldest_blob_file_number: " +
+           std::to_string(oldest_blob_file_number));
+
+  r.append("\n oldest_ancester_time : " + std::to_string(oldest_ancester_time));
+  r.append("\n file_creation_time : " + std::to_string(file_creation_time));
+  r.append("\n epoch_number : " + std::to_string(epoch_number));
+  r.append("\n file_checksum : " + file_checksum);
+  r.append("\n file_checksum_func_name : " + file_checksum_func_name);
+  r.append("\n unique_id : " + std::to_string(unique_id.at(0)) + " " +
+           std::to_string(unique_id.at(1)));
+  r.append("\n");
+  return r;
+}
+
+void FileMetaData::PackRemote(TransferService* node) const {
+  LOG("FileMetaData::PackRemote");
+  assert(fd.table_reader == nullptr);
+  fd.PackRemote(node);
+  assert(table_reader_handle == nullptr);
+
+  size_t file_checksum_len = file_checksum.size();
+  node->send(&file_checksum_len, sizeof(size_t));
+  if (file_checksum_len > 0)
+    node->send(file_checksum.c_str(), file_checksum_len);
+
+  size_t file_checksum_func_name_len = file_checksum_func_name.size();
+  node->send(&file_checksum_func_name_len, sizeof(size_t));
+  if (file_checksum_func_name_len > 0) {
+    node->send(file_checksum_func_name.c_str(), file_checksum_func_name_len);
+  }
+
+  size_t ret_val = smallest.size();
+  node->send(&ret_val, sizeof(size_t));
+  if (ret_val > 0) {
+    ret_val = 0;
+    node->send(smallest.get_rep()->data(), smallest.size());
+  }
+  ret_val = 0;
+
+  ret_val = largest.size();
+  node->send(&ret_val, sizeof(size_t));
+  LOG("FileMetaData::PackRemote largest_len ", ret_val);
+  if (ret_val > 0) {
+    ret_val = 0;
+    node->send(largest.get_rep()->data(), largest.size());
+    LOG("FileMetaData::PackRemote largest: ",
+        largest.get_rep()->substr(0, largest.size()));
+  }
+
+  uint64_t uid[2] = {unique_id.at(0), unique_id.at(1)};
+  node->send(uid, sizeof(uint64_t) * 2);
+  node->send(reinterpret_cast<const char*>(this), sizeof(FileMetaData));
+  LOG("FileMetaData::PackRemote done.");
+}
+
+void* FileMetaData::UnPackRemote(TransferService* node) {
+  LOG("server FileMetaData::UnPackRemote");
+  void* mem = malloc(sizeof(FileMetaData));
+  auto ptr = reinterpret_cast<FileMetaData*>(mem);
+  void* local_fd = FileDescriptor::UnPackRemote(node);
+
+  std::string remote_file_checksum;
+  size_t file_checksum_len = 0;
+  node->receive(&file_checksum_len, sizeof(size_t));
+  if (file_checksum_len > 0) {
+    remote_file_checksum.resize(file_checksum_len);
+    node->receive(remote_file_checksum.data(), file_checksum_len);
+  }
+
+  std::string remote_file_checksum_func_name;
+  size_t file_checksum_func_name_len = 0;
+  node->receive(&file_checksum_func_name_len, sizeof(size_t));
+  if (file_checksum_func_name_len > 0) {
+    remote_file_checksum_func_name.resize(file_checksum_func_name_len);
+    node->receive(remote_file_checksum_func_name.data(),
+                  file_checksum_func_name_len);
+  }
+
+  void* local_smallest = nullptr;
+  size_t smallest_len = 0;
+  node->receive(&smallest_len, sizeof(size_t));
+  if (smallest_len > 0) {
+    local_smallest = malloc(smallest_len);
+    node->receive(local_smallest, smallest_len);
+  }
+
+  void* local_largest = nullptr;
+  size_t largest_len = 0;
+  node->receive(&largest_len, sizeof(size_t));
+  if (largest_len > 0) {
+    local_largest = malloc(largest_len);
+    node->receive(local_largest, largest_len);
+  }
+
+  void* local_uid = malloc(2 * sizeof(uint64_t));
+  node->receive(local_uid, 2 * sizeof(uint64_t));
+
+  node->receive(mem, sizeof(FileMetaData));
+  new (&ptr->file_checksum) std::string(remote_file_checksum);
+  new (&ptr->file_checksum_func_name)
+      std::string(remote_file_checksum_func_name);
+  new (ptr->smallest.get_rep()) std::string();
+  ptr->smallest.get_rep()->resize(smallest_len);
+  memcpy(const_cast<char*>(ptr->smallest.get_rep()->data()),
+         reinterpret_cast<char*>(local_smallest), smallest_len);
+  new (ptr->largest.get_rep()) std::string();
+  ptr->largest.get_rep()->resize(largest_len);
+  memcpy(const_cast<char*>(ptr->largest.get_rep()->data()),
+         reinterpret_cast<char*>(local_largest), largest_len);
+  free(local_largest);
+  free(local_smallest);
+
+  new (&ptr->unique_id) std::array<uint64_t, 2>();
+  ptr->unique_id.at(0) = reinterpret_cast<uint64_t*>(local_uid)[0];
+  ptr->unique_id.at(1) = reinterpret_cast<uint64_t*>(local_uid)[1];
+  ptr->fd = *reinterpret_cast<FileDescriptor*>(local_fd);
+  free(local_fd);
+  free(local_uid);
+
+  LOG("server FileMetaData::UnPackRemote done.");
+  return mem;
+}
+
+void FileMetaData::DoubleCheck(TransferService* node) const {
+  LOG_CERR("CheckDouble:: FileMetaData::fd:", fd.file_size, ' ',
+           fd.smallest_seqno, ' ', fd.largest_seqno, ' ',
+           fd.packed_number_and_path_id);
+  node->send(&(fd.file_size), sizeof(uint64_t));
+  node->send(&(fd.smallest_seqno), sizeof(SequenceNumber));
+  node->send(&(fd.largest_seqno), sizeof(SequenceNumber));
+  node->send(&(fd.packed_number_and_path_id), sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::smallest", smallest.DebugString(true));
+  size_t ret_val = smallest.size();
+  node->send(&ret_val, sizeof(size_t));
+  node->send(smallest.get_rep()->data(), smallest.size());
+  LOG_CERR("CheckDouble:: FileMetaData::largest", largest.DebugString(true));
+  ret_val = largest.size();
+  node->send(&ret_val, sizeof(size_t));
+  node->send(largest.get_rep()->data(), largest.size());
+  LOG_CERR("CheckDouble:: FileMetaData::compensated_file_size",
+           compensated_file_size, ' ', num_entries, ' ', num_deletions, ' ',
+           raw_key_size, ' ', raw_value_size, ' ', num_range_deletions, ' ',
+           compensated_range_deletion_size, ' ', refs, ' ', file_creation_time,
+           ' ', epoch_number, ' ', file_checksum, ' ', unique_id.at(0), ' ',
+           unique_id.at(1));
+  node->send(&compensated_file_size, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::num_entries");
+  node->send(&num_entries, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::num_deletions");
+  node->send(&num_deletions, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::raw_key_size:", raw_key_size);
+  node->send(&raw_key_size, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::raw_value_size:", raw_value_size);
+  node->send(&raw_value_size, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::num_range_deletions");
+  node->send(&num_range_deletions, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::compensated_range_deletion_size");
+  node->send(&compensated_range_deletion_size, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::refs");
+  node->send(&refs, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::file_creation_time");
+  node->send(&file_creation_time, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::epoch_number");
+  node->send(&epoch_number, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: FileMetaData::file_checksum");
+  size_t file_checksum_len = file_checksum.size();
+  node->send(&file_checksum_len, sizeof(size_t));
+  node->send(file_checksum.c_str(), file_checksum_len);
+  LOG_CERR("CheckDouble:: FileMetaData::unique_id");
+  uint64_t uid[2] = {unique_id.at(0), unique_id.at(1)};
+  node->send(uid, sizeof(uint64_t) * 2);
+}
+
+void FileMetaData::PackLocal(TransferService* node) const {
+  LOG("server FileMetaData::PackLocal");
+  fd.PackLocal(node);
+  LOG("server FileMetaData::PackLocal fd");
+  assert(table_reader_handle == nullptr);
+  assert(file_checksum == kUnknownFileChecksum);
+  assert(file_checksum_func_name == kUnknownFileChecksumFuncName);
+
+  size_t ret_val = smallest.size();
+  node->send(&ret_val, sizeof(size_t));
+  if (ret_val > 0) node->send(smallest.get_rep()->data(), smallest.size());
+
+  ret_val = largest.size();
+  node->send(&ret_val, sizeof(size_t));
+  if (ret_val > 0) node->send(largest.get_rep()->data(), largest.size());
+
+  uint64_t uid[2] = {unique_id.at(0), unique_id.at(1)};
+  node->send(uid, sizeof(uint64_t) * 2);
+  node->send(reinterpret_cast<const char*>(this), sizeof(FileMetaData));
+}
+
+void* FileMetaData::UnPackLocal(TransferService* node) {
+  LOG("client FileMetaData::UnPackLocal");
+  void* local_fd = FileDescriptor::UnPackLocal(node);
+  size_t len = 0, len2 = 0;
+  void *data = nullptr, *data2 = nullptr;
+  node->receive(&len, sizeof(size_t));
+  if (len > 0) {
+    data = malloc(len);
+    node->receive(data, len);
+  }
+
+  node->receive(&len2, sizeof(size_t));
+  if (len2 > 0) {
+    data2 = malloc(len2);
+    node->receive(data2, len2);
+  }
+
+  void* local_uid = malloc(2 * sizeof(uint64_t));
+  node->receive(local_uid, 2 * sizeof(uint64_t));
+
+  void* mem = malloc(sizeof(FileMetaData));
+  node->receive(mem, sizeof(FileMetaData));
+  auto ptr = reinterpret_cast<FileMetaData*>(mem);
+  ptr->fd = *reinterpret_cast<FileDescriptor*>(local_fd);
+  free(local_fd);
+  new (&ptr->file_checksum) std::string(kUnknownFileChecksum);
+  new (&ptr->file_checksum_func_name) std::string(kUnknownFileChecksumFuncName);
+  // new (&ptr->smallest.SharedSet(const std::string &now)) InternalKey();
+  if (len > 0) {
+    std::string* sptr = ptr->smallest.get_rep();
+    new (sptr) std::string(reinterpret_cast<const char*>(data), len);
+  } else {
+    std::string* sptr = ptr->smallest.get_rep();
+    new (sptr) std::string();
+  }
+  if (len2 > 0) {
+    std::string* sptr = ptr->largest.get_rep();
+    new (sptr) std::string(reinterpret_cast<const char*>(data2), len2);
+  } else {
+    std::string* sptr = ptr->largest.get_rep();
+    new (sptr) std::string();
+  }
+
+  LOG("client FileMetaData::UnPackLocal unique_id");
+  new (&ptr->unique_id) std::array<uint64_t, 2>();
+  ptr->unique_id.at(0) = reinterpret_cast<uint64_t*>(local_uid)[0];
+  ptr->unique_id.at(1) = reinterpret_cast<uint64_t*>(local_uid)[1];
+  free(local_uid);
+  LOG("client FileMetaData::UnPackLocal unique_id");
+  free(data);
+  free(data2);
+  return mem;
 }
 
 Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
@@ -41,14 +351,12 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
       if (blob_index.file_number() == kInvalidBlobFileNumber) {
         return Status::Corruption("Invalid blob file number");
       }
-
       if (oldest_blob_file_number == kInvalidBlobFileNumber ||
           oldest_blob_file_number > blob_index.file_number()) {
         oldest_blob_file_number = blob_index.file_number();
       }
     }
   }
-
   if (smallest.size() == 0) {
     smallest.DecodeFrom(key);
   }
@@ -57,6 +365,270 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
   fd.largest_seqno = std::max(fd.largest_seqno, seqno);
 
   return Status::OK();
+}
+
+void* VersionEdit::UnPackLocal(TransferService* node,
+                               VersionEdit* version_edit) {
+  void* mem = nullptr;
+  if (version_edit == nullptr)
+    mem = malloc(sizeof(VersionEdit));
+  else
+    mem = reinterpret_cast<void*>(version_edit);
+  node->receive(mem, sizeof(VersionEdit));
+  auto ret_version_edit_ = reinterpret_cast<VersionEdit*>(mem);
+  size_t db_id_len_ = 0;
+  node->receive(&db_id_len_, sizeof(size_t));
+  if (db_id_len_ > 0) {
+    char* db_id_ = new char[db_id_len_];
+    node->receive(db_id_, db_id_len_);
+    new (&ret_version_edit_->db_id_) std::string(db_id_, db_id_len_);
+    delete[] db_id_;
+  } else {
+    new (&ret_version_edit_->db_id_) std::string();
+  }
+
+  size_t comparator_len_ = 0;
+  node->receive(&comparator_len_, sizeof(size_t));
+  if (comparator_len_ > 0) {
+    char* comparator_ = new char[comparator_len_];
+    node->receive(comparator_, comparator_len_);
+    new (&ret_version_edit_->comparator_)
+        std::string(comparator_, comparator_len_);
+    delete[] comparator_;
+  } else {
+    new (&ret_version_edit_->comparator_) std::string();
+  }
+
+  new (&ret_version_edit_->compact_cursors_)
+      std::vector<std::pair<int, InternalKey>>();
+  size_t compact_cursors_size_ = 0;
+  node->receive(&compact_cursors_size_, sizeof(size_t));
+  for (size_t i = 0; i < compact_cursors_size_; i++) {
+    int level = 0;
+    node->receive(&level, sizeof(int));
+    size_t str_len_ = 0;
+    node->receive(&str_len_, sizeof(size_t));
+    char* str_ = new char[str_len_];
+    node->receive(str_, str_len_);
+    InternalKey key;
+    key.DecodeFrom(Slice(str_, str_len_));
+    ret_version_edit_->compact_cursors_.emplace_back(level, key);
+    delete[] str_;
+  }
+
+  LOG_CERR("UnpackLocal:: DeletedFiles")
+  new (&ret_version_edit_->deleted_files_) DeletedFiles();
+  ret_version_edit_->deleted_files_.clear();
+  size_t deleted_files_size_ = 0;
+  node->receive(&deleted_files_size_, sizeof(size_t));
+  LOG_CERR("UnpackLocal:: DeletedFiles:: ", deleted_files_size_);
+  for (size_t i = 0; i < deleted_files_size_; i++) {
+    int level = 0;
+    node->receive(&level, sizeof(int));
+    uint64_t file_number = 0;
+    node->receive(&file_number, sizeof(uint64_t));
+    LOG_CERR("UnpackLocal:: DeletedFiles:: ", level, ' ', file_number);
+    ret_version_edit_->deleted_files_.insert(
+        std::make_pair(level, file_number));
+  }
+  LOG_CERR("UnpackLocal:: DeletedFiles::End ", deleted_files_size_);
+
+  new (&ret_version_edit_->new_files_)
+      std::vector<std::pair<int, FileMetaData>>();
+  size_t new_files_size_ = 0;
+  node->receive(&new_files_size_, sizeof(size_t));
+  for (size_t i = 0; i < new_files_size_; i++) {
+    int level = 0;
+    node->receive(&level, sizeof(int));
+    auto local_file_meta_data =
+        reinterpret_cast<FileMetaData*>(FileMetaData::UnPackLocal(node));
+    ret_version_edit_->new_files_.emplace_back(level, *local_file_meta_data);
+    free(local_file_meta_data);
+  }
+
+  new (&ret_version_edit_->blob_file_additions_)
+      std::vector<BlobFileAddition>();
+  new (&ret_version_edit_->blob_file_garbages_) std::vector<BlobFileGarbage>();
+
+  new (&ret_version_edit_->wal_additions_) std::vector<WalAddition>();
+  new (&ret_version_edit_->wal_deletion_) WalDeletion();
+
+  size_t column_family_name_len = 0;
+  node->receive(&column_family_name_len, sizeof(size_t));
+  if (column_family_name_len > 0) {
+    char* column_family_name_ = new char[column_family_name_len];
+    node->receive(column_family_name_, column_family_name_len);
+    new (&ret_version_edit_->column_family_name_)
+        std::string(column_family_name_, column_family_name_len);
+    delete[] column_family_name_;
+  } else {
+    new (&ret_version_edit_->column_family_name_) std::string();
+  }
+
+  size_t full_history_ts_low_size = 0;
+  node->receive(&full_history_ts_low_size, sizeof(size_t));
+  if (full_history_ts_low_size > 0) {
+    char* full_history_ts_low_ = new char[full_history_ts_low_size];
+    node->receive(full_history_ts_low_, full_history_ts_low_size);
+    new (&ret_version_edit_->full_history_ts_low_)
+        std::string(full_history_ts_low_, full_history_ts_low_size);
+    delete[] full_history_ts_low_;
+  } else {
+    new (&ret_version_edit_->full_history_ts_low_) std::string();
+  }
+  return mem;
+}
+
+void VersionEdit::DoubleCheck(TransferService* node) const {
+  LOG_CERR("CheckDouble:: VersionEdit::max_level_");
+  node->send(&max_level_, sizeof(int));
+  LOG_CERR("CheckDouble:: VersionEdit::log_number_");
+  node->send(&log_number_, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: VersionEdit::prev_log_number_");
+  node->send(&prev_log_number_, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: VersionEdit::next_file_number_");
+  node->send(&next_file_number_, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: VersionEdit::max_column_family_");
+  node->send(&max_column_family_, sizeof(int));
+  LOG_CERR("CheckDouble:: VersionEdit::min_log_number_to_keep_");
+  node->send(&min_log_number_to_keep_, sizeof(uint64_t));
+  LOG_CERR("CheckDouble:: VersionEdit::last_sequence_");
+  node->send(&last_sequence_, sizeof(SequenceNumber));
+  LOG_CERR("CheckDouble:: VersionEdit::has_log_number_");
+  node->send(&has_log_number_, sizeof(bool));
+  LOG_CERR("CheckDouble:: VersionEdit::has_prev_log_number_");
+  node->send(&has_prev_log_number_, sizeof(bool));
+  LOG_CERR("CheckDouble:: VersionEdit::has_next_file_number_");
+  node->send(&has_next_file_number_, sizeof(bool));
+  LOG_CERR("CheckDouble:: VersionEdit::has_max_column_family_");
+  node->send(&has_max_column_family_, sizeof(bool));
+  LOG_CERR("CheckDouble:: VersionEdit::has_min_log_number_to_keep_");
+  node->send(&has_min_log_number_to_keep_, sizeof(bool));
+  LOG_CERR("CheckDouble:: VersionEdit::has_last_sequence_");
+  node->send(&has_last_sequence_, sizeof(bool));
+  LOG_CERR("CheckDouble:: VersionEdit::CompactCursors");
+  size_t compact_cursors_size_ = compact_cursors_.size();
+  node->send(&compact_cursors_size_, sizeof(size_t));
+  for (auto pr : compact_cursors_) {
+    node->send(&pr.first, sizeof(int));
+    auto string_ptr = pr.second.get_rep();
+    size_t str_len_ = string_ptr->length();
+    node->send(&str_len_, sizeof(size_t));
+    node->send(string_ptr->c_str(), str_len_);
+  }
+  // LOG_CERR("CheckDouble:: VersionEdit::DeletedFiles");
+  size_t deleted_files_size_ = deleted_files_.size();
+  node->send(&deleted_files_size_, sizeof(size_t));
+  for (auto it = deleted_files_.begin(); it != deleted_files_.end(); it++) {
+    node->send(&(it->first), sizeof(int));
+    node->send(&(it->second), sizeof(uint64_t));
+  }
+  LOG_CERR("CheckDouble:: VersionEdit::NewFiles");
+  size_t new_files_size_ = new_files_.size();
+  node->send(&new_files_size_, sizeof(size_t));
+  // for (auto pr : new_files_) {
+  //   node->send(&pr.first, sizeof(int));
+  //   pr.second.PackLocal(node);
+  // }
+  // LOG_CERR("CheckDouble:: VersionEdit::remaining_entries_");
+  node->send(&remaining_entries_, sizeof(uint32_t));
+  // LOG_CERR("CheckDouble:: VersionEdit::full_history_ts_low_");
+  size_t full_history_ts_low_size = full_history_ts_low_.size();
+  node->send(&full_history_ts_low_size, sizeof(size_t));
+  if (full_history_ts_low_size > 0) {
+    node->send(full_history_ts_low_.c_str(), full_history_ts_low_size);
+  }
+}
+
+void VersionEdit::PackLocal(TransferService* node) const {
+  node->send(reinterpret_cast<const void*>(this), sizeof(VersionEdit));
+  size_t db_id_len_ = db_id_.size();
+  node->send(&db_id_len_, sizeof(size_t));
+  if (db_id_len_ > 0) node->send(db_id_.c_str(), db_id_len_);
+
+  size_t comparator_len_ = comparator_.size();
+  node->send(&comparator_len_, sizeof(size_t));
+  if (comparator_.size() > 0)
+    node->send(comparator_.c_str(), comparator_.size());
+
+  size_t compact_cursors_size_ = compact_cursors_.size();
+  node->send(&compact_cursors_size_, sizeof(size_t));
+  for (auto pr : compact_cursors_) {
+    node->send(&pr.first, sizeof(int));
+    auto string_ptr = pr.second.get_rep();
+    size_t str_len_ = string_ptr->length();
+    node->send(&str_len_, sizeof(size_t));
+    node->send(string_ptr->c_str(), str_len_);
+  }
+
+  size_t deleted_files_size_ = deleted_files_.size();
+  node->send(&deleted_files_size_, sizeof(size_t));
+  for (auto pr : deleted_files_) {
+    int level = pr.first;
+    uint64_t file_number = pr.second;
+    node->send(&level, sizeof(int));
+    node->send(&file_number, sizeof(uint64_t));
+  }
+
+  size_t new_files_size_ = new_files_.size();
+  node->send(&new_files_size_, sizeof(size_t));
+  for (auto pr : new_files_) {
+    node->send(&pr.first, sizeof(int));
+    pr.second.PackLocal(node);
+  }
+
+  size_t column_family_name_len = column_family_name_.size();
+  node->send(&column_family_name_len, sizeof(size_t));
+  if (column_family_name_len > 0) {
+    node->send(column_family_name_.c_str(), column_family_name_len);
+  }
+
+  size_t full_history_ts_low_size = full_history_ts_low_.size();
+  node->send(&full_history_ts_low_size, sizeof(size_t));
+  if (full_history_ts_low_size > 0) {
+    node->send(full_history_ts_low_.c_str(), full_history_ts_low_size);
+  }
+}
+
+void VersionEdit::free_remote() {
+  new_files_.~NewFiles();
+  db_id_.~basic_string();
+  comparator_.~basic_string();
+  column_family_name_.~basic_string();
+  full_history_ts_low_.~basic_string();
+  compact_cursors_.~CompactCursors();
+  wal_additions_.~WalAdditions();
+  deleted_files_.~DeletedFiles();
+}
+
+void VersionEdit::PackRemote(TransferService* node) const {
+  LOG("VersionEdit::PackRemote");
+  size_t new_file_size_ = new_files_.size();
+  node->send(&new_file_size_, sizeof(size_t));
+  for (size_t i = 0; i < new_file_size_; i++) {
+    node->send(&new_files_[i].first, sizeof(int));
+    new_files_[i].second.PackRemote(node);
+  }
+  node->send(&has_last_sequence_, sizeof(bool));
+  node->send(&last_sequence_, sizeof(SequenceNumber));
+  LOG("VersionEdit::PackRemote done.");
+}
+
+void VersionEdit::UnPackRemote(TransferService* node) {
+  LOG("VersionEdit::UnPackRemote");
+  size_t new_file_size_ = 0;
+  node->receive(&new_file_size_, sizeof(size_t));
+  for (size_t i = 0; i < new_file_size_; i++) {
+    int level = 0;
+    node->receive(&level, sizeof(int));
+    auto local_file_meta_data =
+        reinterpret_cast<FileMetaData*>(FileMetaData::UnPackRemote(node));
+    new_files_.push_back(std::make_pair(level, *local_file_meta_data));
+    free(local_file_meta_data);
+  }
+  node->receive(&has_last_sequence_, sizeof(bool));
+  node->receive(&last_sequence_, sizeof(SequenceNumber));
+  LOG("VersionEdit::UnPackRemote done.");
 }
 
 void VersionEdit::Clear() {
@@ -139,6 +711,7 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
         f.epoch_number == kUnknownEpochNumber) {
       return false;
     }
+
     PutVarint32(dst, kNewFile4);
     PutVarint32Varint64(dst, new_files_[i].first /* level */, f.fd.GetNumber());
     PutVarint64(dst, f.fd.GetFileSize());
@@ -231,6 +804,7 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
       std::string unique_id_str = EncodeUniqueIdBytes(&unique_id);
       PutLengthPrefixedSlice(dst, Slice(unique_id_str));
     }
+
     if (f.compensated_range_deletion_size) {
       PutVarint32(dst, kCompensatedRangeDeletionSize);
       std::string compensated_range_deletion_size;

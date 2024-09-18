@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <set>
@@ -56,6 +57,7 @@
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/stop_watch.h"
+#include "utilities/rf_stats.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -614,6 +616,7 @@ void CompactionJob::GenSubcompactionBoundaries() {
 }
 
 Status CompactionJob::Run() {
+  uint64_t start = Env::Default()->NowMicros();
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_RUN);
   TEST_SYNC_POINT("CompactionJob::Run():Start");
@@ -807,6 +810,10 @@ Status CompactionJob::Run() {
   TEST_SYNC_POINT("CompactionJob::Run():End");
 
   compact_->status = status;
+  uint64_t end = Env::Default()->NowMicros();
+  uint64_t elapsed_micros = end - start;
+  Singleton<rf_stats>::GetInstance()->ReportCompaction(start, end,
+                                                       elapsed_micros);
   return status;
 }
 
@@ -1002,12 +1009,10 @@ void CompactionJob::NotifyOnSubcompactionBegin(
     listener->OnSubcompactionBegin(info);
   }
   info.status.PermitUncheckedError();
-
 }
 
 void CompactionJob::NotifyOnSubcompactionCompleted(
     SubcompactionState* sub_compact) {
-
   if (db_options_.listeners.empty()) {
     return;
   }
@@ -1899,7 +1904,6 @@ void CopyPrefix(const Slice& src, size_t prefix_length, std::string* dst) {
   dst->assign(src.data(), length);
 }
 }  // namespace
-
 
 void CompactionJob::UpdateCompactionStats() {
   assert(compact_);

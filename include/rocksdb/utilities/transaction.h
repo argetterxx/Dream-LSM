@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <limits>
 #include <string>
 #include <vector>
@@ -681,4 +680,3 @@ class Transaction {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

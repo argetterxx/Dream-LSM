@@ -24,7 +24,6 @@
 #include "test_util/testutil.h"
 #include "util/random.h"
 
-
 namespace ROCKSDB_NAMESPACE {
 
 // A helper function that ensures the table properties returned in
@@ -614,7 +613,6 @@ INSTANTIATE_TEST_CASE_P(DBTablePropertiesTest, DBTablePropertiesTest,
                                           "kCompactionStyleUniversal"));
 
 }  // namespace ROCKSDB_NAMESPACE
-
 
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();

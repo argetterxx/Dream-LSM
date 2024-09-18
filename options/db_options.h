@@ -5,15 +5,23 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
 #include "rocksdb/options.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 
 namespace ROCKSDB_NAMESPACE {
 class SystemClock;
 
 struct ImmutableDBOptions {
+ public:
+  void PackLocal(TransferService* node) const;
+  static void* UnPackLocal(TransferService* node);
+
+ public:
   static const char* kName() { return "ImmutableDBOptions"; }
   ImmutableDBOptions();
   explicit ImmutableDBOptions(const DBOptions& options);
@@ -104,6 +112,13 @@ struct ImmutableDBOptions {
   Logger* logger;
   std::shared_ptr<CompactionService> compaction_service;
   bool enforce_single_del_contracts;
+
+  size_t worker_use_remote_flush = 0;
+  size_t server_remote_flush = 0;
+  IndexCache* local_index_cache = nullptr;
+
+  void* option_file_path = nullptr;
+  bool is_pacakged = false;
 
   bool IsWalDirSameAsDBPath() const;
   bool IsWalDirSameAsDBPath(const std::string& path) const;

@@ -14,10 +14,14 @@
 
 #pragma once
 
+#include <cassert>
 #include <memory>
 #include <string>
 
 #include "rocksdb/customizable.h"
+#include "rocksdb/logger.hpp"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -33,6 +37,13 @@ struct ConfigOptions;
 // because RocksDB is not exception-safe. This could cause undefined behavior
 // including data loss, unreported corruption, deadlocks, and more.
 class SliceTransform : public Customizable {
+ public:
+  virtual int64_t identifier() const { assert(false); }
+  virtual void PackLocal(TransferService*) const {
+    LOG("SliceTransform::PackLocal: error: not implemented");
+    assert(false);
+  };
+
  public:
   virtual ~SliceTransform(){};
 

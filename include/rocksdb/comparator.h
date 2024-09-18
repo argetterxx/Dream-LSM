@@ -8,9 +8,13 @@
 
 #pragma once
 
+#include <cassert>
 #include <string>
 
 #include "rocksdb/customizable.h"
+#include "rocksdb/logger.hpp"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -20,6 +24,12 @@ class Slice;
 // The general interface for comparing two Slices are defined for both of
 // Comparator and some internal data structures.
 class CompareInterface {
+ public:
+  virtual void PackLocal(TransferService*) const {
+    LOG("CompareInterface::PackLocal");
+    assert(false);
+  };
+
  public:
   virtual ~CompareInterface() {}
 
@@ -42,6 +52,12 @@ class CompareInterface {
 // because RocksDB is not exception-safe. This could cause undefined behavior
 // including data loss, unreported corruption, deadlocks, and more.
 class Comparator : public Customizable, public CompareInterface {
+ public:
+  void PackLocal(TransferService*) const override {
+    LOG("Comparator::PackLocal");
+    assert(false);
+  }
+
  public:
   Comparator() : timestamp_size_(0) {}
 

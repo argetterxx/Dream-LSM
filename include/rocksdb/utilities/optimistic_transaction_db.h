@@ -95,4 +95,3 @@ class OptimisticTransactionDB : public StackableDB {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

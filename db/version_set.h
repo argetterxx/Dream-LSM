@@ -47,6 +47,8 @@
 #include "db/version_edit.h"
 #include "db/write_controller.h"
 #include "env/file_system_tracer.h"
+#include "rocksdb/options.h"
+#include "rocksdb/remote_flush_service.h"
 #if USE_COROUTINES
 #include "folly/experimental/coro/BlockingWait.h"
 #include "folly/experimental/coro/Collect.h"
@@ -126,6 +128,11 @@ enum EpochNumberRequirement {
 // levels of LSM tree, files information at each level, files marked for
 // compaction, blob files, etc.
 class VersionStorageInfo {
+ public:
+  void PackLocal(TransferService* node) const;
+  void DoubleCheck(TransferService* node) const;
+  static void* UnPackLocal(TransferService* node);
+
  public:
   VersionStorageInfo(const InternalKeyComparator* internal_comparator,
                      const Comparator* user_comparator, int num_levels,
@@ -819,6 +826,11 @@ using MultiGetRange = MultiGetContext::Range;
 // the column family at a certain point in time.
 class Version {
  public:
+  void PackLocal(TransferService* node) const;
+  void DoubleCheck(TransferService* node) const;
+  static void* UnPackLocal(TransferService* node, void* cfd_ptr);
+
+ public:
   // Append to *iters a sequence of iterators that will
   // yield the contents of this Version when merged together.
   // @param read_options Must outlive any iterator built by
@@ -1116,6 +1128,14 @@ class AtomicGroupReadBuffer {
 // column families via ColumnFamilySet, i.e. set of the column families.
 class VersionSet {
  public:
+  void free_remote();
+  void PackLocal(TransferService* node) const;
+  void DoubleCheck(TransferService* node) const;
+  static void* UnPackLocal(TransferService* node);
+  void PackRemote(TransferService* node) const;
+  static void UnPackRemote(TransferService* node, VersionSet* vset);
+
+ public:
   VersionSet(const std::string& dbname, const ImmutableDBOptions* db_options,
              const FileOptions& file_options, Cache* table_cache,
              WriteBufferManager* write_buffer_manager,
@@ -1180,6 +1200,7 @@ class VersionSet {
     mutable_cf_options_list.emplace_back(&mutable_cf_options);
     autovector<autovector<VersionEdit*>> edit_lists;
     edit_lists.emplace_back(edit_list);
+    LOG("");
     return LogAndApply(cfds, mutable_cf_options_list, edit_lists, mu,
                        dir_contains_current_file, new_descriptor_log,
                        column_family_options, {manifest_wcb});
@@ -1255,7 +1276,6 @@ class VersionSet {
   // printf contents (for debugging)
   Status DumpManifest(Options& options, std::string& manifestFileName,
                       bool verbose, bool hex = false, bool json = false);
-
 
   const std::string& DbSessionId() const { return db_session_id_; }
 
@@ -1543,7 +1563,6 @@ class VersionSet {
 
   // Protected by DB mutex.
   WalSet wals_;
-
   std::unique_ptr<ColumnFamilySet> column_family_set_;
   Cache* table_cache_;
   Env* const env_;

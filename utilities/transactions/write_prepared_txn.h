@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -114,4 +113,3 @@ class WritePreparedTxn : public PessimisticTransaction {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

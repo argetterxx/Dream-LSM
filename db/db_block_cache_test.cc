@@ -302,7 +302,6 @@ class ReadOnlyCacheWrapper : public CacheWrapper {
 }  // anonymous namespace
 #endif  // SNAPPY
 
-
 // Make sure that when options.block_cache is set, after a new table is
 // created its index/filter blocks are added to block cache.
 TEST_F(DBBlockCacheTest, IndexAndFilterBlocksOfNewTableAddedToCache) {
@@ -1333,7 +1332,6 @@ TEST_F(DBBlockCacheTest, HyperClockCacheReportProblems) {
   dbfull()->DumpStats();
   EXPECT_EQ(logger->PopCounts(), (std::array<int, 3>{{0, 1, 0}}));
 }
-
 
 class DBBlockCacheKeyTest
     : public DBTestBase,

@@ -6,6 +6,7 @@
 #pragma once
 
 #include "db/version_set.h"
+#include "rocksdb/options.h"
 
 namespace ROCKSDB_NAMESPACE {
 

@@ -3463,7 +3463,6 @@ TEST_F(DBBloomFilterTest, WeirdPrefixExtractorWithFilter3) {
   }
 }
 
-
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

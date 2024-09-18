@@ -283,7 +283,6 @@ TEST_F(RandomAccessFileReaderTest, MultiReadDirectIO) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-
 TEST(FSReadRequest, Align) {
   FSReadRequest r;
   r.offset = 2000;

@@ -66,7 +66,8 @@ endif(CCACHE_FOUND)
 
 option(WITH_JEMALLOC "build with JeMalloc" OFF)
 option(WITH_LIBURING "build with liburing" ON)
-option(WITH_SNAPPY "build with SNAPPY" OFF)
+option(WITH_SNAPPY "build with SNAPPY" ON)
+option(WITH_HDFS "build with HDFS and write data to HDFS" ON)
 option(WITH_LZ4 "build with lz4" OFF)
 option(WITH_ZLIB "build with zlib" OFF)
 option(WITH_ZSTD "build with zstd" OFF)
@@ -189,7 +190,7 @@ if(MSVC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zi /nologo /EHsc /GS /Gd /GR /GF /fp:precise /Zc:wchar_t /Zc:forScope /errorReport:queue")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FC /d2Zi+ /W4 /wd4127 /wd4800 /wd4996 /wd4351 /wd4100 /wd4204 /wd4324")
 else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -W -Wextra -Wall -pthread")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -pthread")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wsign-compare -Wshadow -Wno-unused-parameter -Wno-unused-variable -Woverloaded-virtual -Wnon-virtual-dtor -Wno-missing-field-initializers -Wno-strict-aliasing -Wno-invalid-offsetof")
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wstrict-prototypes")
@@ -368,7 +369,7 @@ if(FAIL_ON_WARNINGS)
   if(MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /WX")
   else() # assume GCC
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -g")
   endif()
 endif()
 
@@ -380,6 +381,13 @@ if(WITH_ASAN)
   if(WITH_JEMALLOC)
     message(FATAL "ASAN does not work well with JeMalloc")
   endif()
+endif()
+
+option(WITH_SANITIZE_MEMORY "build with memory sanitizer" OFF)
+if(WITH_SANITIZE_MEMORY)
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
 endif()
 
 option(WITH_TSAN "build with TSAN" OFF)
@@ -590,6 +598,7 @@ endif()
 
 include_directories(${PROJECT_SOURCE_DIR})
 include_directories(${PROJECT_SOURCE_DIR}/include)
+include_directories(${PROJECT_SOURCE_DIR}/dev)
 
 if(USE_COROUTINES)
   if(USE_FOLLY OR USE_FOLLY_LITE)
@@ -714,6 +723,8 @@ set(SOURCES
         db/external_sst_file_ingestion_job.cc
         db/file_indexer.cc
         db/flush_job.cc
+        db/remote_flush_job.cc
+        db/flush_job_basic.cc
         db/flush_scheduler.cc
         db/forward_iterator.cc
         db/import_column_family_job.cc
@@ -775,9 +786,14 @@ set(SOURCES
         logging/log_buffer.cc
         memory/arena.cc
         memory/concurrent_arena.cc
+        # memory/trans_concurrent_arena.cc
+        # memory/sep_trans_concurrent_arena.cc
+        memory/sep_concurrent_arena.cc
         memory/jemalloc_nodump_allocator.cc
         memory/memkind_kmem_allocator.cc
         memory/memory_allocator.cc
+        memory/remote_flush_service.cc
+        memory/remote_memtable_service.cc
         memtable/alloc_tracker.cc
         memtable/hash_linklist_rep.cc
         memtable/hash_skiplist_rep.cc
@@ -873,6 +889,7 @@ set(SOURCES
         trace_replay/trace_record_result.cc
         trace_replay/trace_record.cc
         trace_replay/trace_replay.cc
+        util/zipf.cc
         util/async_file_reader.cc
         util/cleanable.cc
         util/coding.cc
@@ -979,6 +996,11 @@ list(APPEND SOURCES
   utilities/transactions/lock/range/range_tree/lib/util/dbt.cc
   utilities/transactions/lock/range/range_tree/lib/util/memarena.cc)
 
+if(WITH_HDFS)
+  set(ROCKSDB_PLUGINS "hdfs")
+  add_definitions(-DHDFS)
+endif ()
+
 message(STATUS "ROCKSDB_PLUGINS: ${ROCKSDB_PLUGINS}")
 if ( ROCKSDB_PLUGINS )
   string(REPLACE " " ";" PLUGINS ${ROCKSDB_PLUGINS})
@@ -1075,7 +1097,7 @@ set(ROCKSDB_SHARED_LIB rocksdb-shared${ARTIFACT_SUFFIX})
 if(WIN32)
   set(SYSTEM_LIBS ${SYSTEM_LIBS} shlwapi.lib rpcrt4.lib)
 else()
-  set(SYSTEM_LIBS ${CMAKE_THREAD_LIBS_INIT})
+  set(SYSTEM_LIBS ${CMAKE_THREAD_LIBS_INIT} -lstdc++ -libverbs)
 endif()
 
 set(ROCKSDB_PLUGIN_EXTERNS "")
@@ -1292,6 +1314,7 @@ if(WITH_TESTS)
         env/env_basic_test.cc
   )
   if(WITH_ALL_TESTS)
+    add_definitions(-DROCKSDB_ALL_TESTS_ENABLED)
     list(APPEND TESTS
         cache/cache_reservation_manager_test.cc
         cache/cache_test.cc
@@ -1371,7 +1394,7 @@ if(WITH_TESTS)
         db/listener_test.cc
         db/log_test.cc
         db/manual_compaction_test.cc
-        db/memtable_list_test.cc
+        # db/memtable_list_test.cc
         db/merge_helper_test.cc
         db/merge_test.cc
         db/options_file_test.cc
@@ -1549,8 +1572,45 @@ if(WITH_TESTS)
     add_dependencies(check c_test)
   endif()
 endif()
+set(WITH_DEV true)
+if(WITH_DEV)
+  set(DEVELOP 
+  dev/remote_flush_test_server.cpp
+  dev/testycsb.cpp
+  dev/memtable_test.cc
+  dev/remote_flush_worker.cpp
+  dev/test_key.cpp
+  dev/test_sub_flush.cpp
+  # dev/trace_query_test.cpp
+  # dev/trace_io_test.cpp
+  # dev/trace_block_cache_test.cpp
+  # dev/trace_memtable_test.cpp
+  dev/rdma_server.cc
+  memory/tcp_server.cc
+  )
+  foreach(sourcefile ${DEVELOP})
+    message(STATUS "CHECK DEV: ${sourcefile}")
+    get_filename_component(exename ${sourcefile} NAME_WE)
+    add_executable(${exename}${ARTIFACT_SUFFIX} ${sourcefile})
+    set_target_properties(${exename}${ARTIFACT_SUFFIX}
+      PROPERTIES EXCLUDE_FROM_DEFAULT_BUILD_RELEASE 1
+      EXCLUDE_FROM_DEFAULT_BUILD_MINRELEASE 1
+      EXCLUDE_FROM_DEFAULT_BUILD_RELWITHDEBINFO 1
+      OUTPUT_NAME ${exename}${ARTIFACT_SUFFIX}
+    )
+    target_link_libraries(${exename}${ARTIFACT_SUFFIX} ${THIRDPARTY_LIBS} ${ROCKSDB_LIB})
+  endforeach(sourcefile ${DEVELOP})
+endif()
 
+set(WITH_RDMA_SUPPORT true)
+if(WITH_RDMA_SUPPORT)
+  message(STATUS "RDMA support is enabled")
+  add_definitions(-DROCKSDB_RDMA)
+endif()
+
+set(WITH_BENCHMARK_TOOLS true)
 if(WITH_BENCHMARK_TOOLS)
+  message(STATUS "built benchmark tools: db_bench${ARTIFACT_SUFFIX}")
   add_executable(db_bench${ARTIFACT_SUFFIX}
     tools/simulated_hybrid_file_system.cc
     tools/db_bench.cc

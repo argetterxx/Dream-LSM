@@ -1,3 +1,4 @@
+
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
@@ -6,6 +7,9 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+
+#include "rocksdb/remote_flush_service.h"
+#include "util/zipf.h"
 
 #ifdef GFLAGS
 #ifdef NUMA
@@ -18,6 +22,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
+
+#include <cmath>
+#include <cstdint>
 #ifdef __APPLE__
 #include <mach/host_info.h>
 #include <mach/mach_host.h>
@@ -89,6 +96,7 @@
 #include "utilities/merge_operators/bytesxor.h"
 #include "utilities/merge_operators/sortlist.h"
 #include "utilities/persistent_cache/block_cache_tier.h"
+#include "utilities/rf_stats.h"
 
 #ifdef MEMKIND
 #include "memory/memkind_kmem_allocator.h"
@@ -109,6 +117,8 @@ DEFINE_string(
     "fillseqdeterministic,"
     "fillsync,"
     "fillrandom,"
+    "ycsbworkloadzipfian,"
+    "ycsbworkloadlatest,"
     "filluniquerandomdeterministic,"
     "overwrite,"
     "readrandom,"
@@ -241,9 +251,11 @@ DEFINE_string(
     "operation includes a rare but possible retry in case it got "
     "`Status::Incomplete()`. This happens upon encountering more keys than "
     "have ever been seen by the thread (or eight initially)\n"
-    "\tbackup --  Create a backup of the current DB and verify that a new backup is corrected. "
+    "\tbackup --  Create a backup of the current DB and verify that a new "
+    "backup is corrected. "
     "Rate limit can be specified through --backup_rate_limit\n"
-    "\trestore -- Restore the DB from the latest backup available, rate limit can be specified through --restore_rate_limit\n");
+    "\trestore -- Restore the DB from the latest backup available, rate limit "
+    "can be specified through --restore_rate_limit\n");
 
 DEFINE_int64(num, 1000000, "Number of key/values to place in database");
 
@@ -438,7 +450,10 @@ DEFINE_int32(max_write_buffer_number,
              ROCKSDB_NAMESPACE::Options().max_write_buffer_number,
              "The number of in-memory memtables. Each memtable is of size"
              " write_buffer_size bytes.");
-
+DEFINE_int32(max_local_write_buffer_number,
+             ROCKSDB_NAMESPACE::Options().max_local_write_buffer_number,
+             "use this when server_remote_flush is true. The number of local "
+             "memtable number for each CF. default is 2.");
 DEFINE_int32(min_write_buffer_number_to_merge,
              ROCKSDB_NAMESPACE::Options().min_write_buffer_number_to_merge,
              "The minimum number of write buffers that will be merged together"
@@ -592,6 +607,8 @@ DEFINE_string(compressed_secondary_cache_compression_type, "lz4",
 static enum ROCKSDB_NAMESPACE::CompressionType
     FLAGS_compressed_secondary_cache_compression_type_e =
         ROCKSDB_NAMESPACE::kLZ4Compression;
+static std::once_flag remote_flush_port_once;
+static rocksdb::PDClient* pd_client = nullptr;
 
 DEFINE_uint32(
     compressed_secondary_cache_compress_format_version, 2,
@@ -1034,7 +1051,6 @@ DEFINE_string(
 static enum ROCKSDB_NAMESPACE::CompressionType
     FLAGS_blob_db_compression_type_e = ROCKSDB_NAMESPACE::kSnappyCompression;
 
-
 // Integrated BlobDB options
 DEFINE_bool(
     enable_blob_files,
@@ -1105,7 +1121,6 @@ DEFINE_int32(prepopulate_blob_cache, 0,
              "[Integrated BlobDB] Pre-populate hot/warm blobs in blob cache. 0 "
              "to disable and 1 to insert during flush.");
 
-
 // Secondary DB instance Options
 DEFINE_bool(use_secondary_db, false,
             "Open a RocksDB secondary instance. A primary instance can be "
@@ -1119,13 +1134,11 @@ DEFINE_int32(secondary_update_interval, 5,
              "Secondary instance attempts to catch up with the primary every "
              "secondary_update_interval seconds.");
 
-
 DEFINE_bool(report_bg_io_stats, false,
             "Measure times spents on I/Os while in compactions. ");
 
 DEFINE_bool(use_stderr_info_logger, false,
             "Write info logs to stderr instead of to LOG file. ");
-
 
 DEFINE_string(trace_file, "", "Trace workload to a file. ");
 
@@ -1235,6 +1248,19 @@ DEFINE_uint64(
     "Rocksdb implicit readahead is enabled if reads are sequential and "
     "num_file_reads_for_auto_readahead indicates after how many sequential "
     "reads into that file internal auto prefetching should be start.");
+
+DEFINE_uint32(use_remote_flush,
+              ROCKSDB_NAMESPACE::Options().server_remote_flush,
+              "Use remote flush, 0 means disable, 1 means enable");
+
+DEFINE_bool(use_single_thread_pool, false,
+            "Use single thread pool for all threads");
+
+DEFINE_string(memnode_ip, "", "memnode ip");
+DEFINE_uint32(memnode_port, 0, "memnode port");
+DEFINE_string(local_ip, "", "local ip");
+DEFINE_int32(memnode_heartbeat_port, 10086, "memnode heartbeat port");
+DEFINE_bool(report_fillrandom_latency_and_load, false, "");
 
 static enum ROCKSDB_NAMESPACE::CompressionType StringToCompressionType(
     const char* ctype) {
@@ -1731,6 +1757,12 @@ DEFINE_bool(build_info, false,
 DEFINE_bool(track_and_verify_wals_in_manifest, false,
             "If true, enable WAL tracking in the MANIFEST");
 
+DEFINE_bool(track_flush_compaction_stats, false, "");
+
+DEFINE_int64(ycsb_workload_num, 1000000, "");
+DEFINE_bool(ycsb_uniform_distribution, false,
+            "Uniform key distribution for YCSB");
+
 namespace ROCKSDB_NAMESPACE {
 namespace {
 static Status CreateMemTableRepFactory(
@@ -1918,11 +1950,7 @@ struct DBWithColumnFamilies {
   std::vector<int> cfh_idx_to_prob;  // ith index holds probability of operating
                                      // on cfh[i].
 
-  DBWithColumnFamilies()
-      : db(nullptr)
-        ,
-        opt_txn_db(nullptr)
-  {
+  DBWithColumnFamilies() : db(nullptr), opt_txn_db(nullptr) {
     cfh.clear();
     num_created = 0;
     num_hot = 0;
@@ -1934,8 +1962,7 @@ struct DBWithColumnFamilies {
         opt_txn_db(other.opt_txn_db),
         num_created(other.num_created.load()),
         num_hot(other.num_hot),
-        cfh_idx_to_prob(other.cfh_idx_to_prob) {
-  }
+        cfh_idx_to_prob(other.cfh_idx_to_prob) {}
 
   void DeleteDBs() {
     std::for_each(cfh.begin(), cfh.end(),
@@ -2572,6 +2599,77 @@ class TimestampEmulator {
   }
 };
 
+void ReportV2(const std::vector<std::pair<size_t, double>>& sec_latency_records,
+              const std::vector<std::pair<size_t, double>>& sec_bytes_records,
+              uint64_t* P99_latency, uint64_t ops_num) {
+  if (sec_latency_records.size() == 0 || sec_bytes_records.size() == 0) {
+    printf("not collected enough data from every thread\n");
+    return;
+  }
+  std::vector<double> latency_records;
+  std::vector<double> bytes_records;
+  size_t latency_index = 0;
+  size_t bytes_index = 0;
+  for (const auto& sec_latency_record : sec_latency_records) {
+    latency_index = latency_index > sec_latency_record.first
+                        ? latency_index
+                        : sec_latency_record.first;
+  }
+  for (const auto& sec_bytes_record : sec_bytes_records) {
+    bytes_index = bytes_index > sec_bytes_record.first ? bytes_index
+                                                       : sec_bytes_record.first;
+  }
+  latency_records.resize(latency_index + 1);
+  bytes_records.resize(bytes_index + 1);
+  std::vector<int> latency_cnt;
+  latency_cnt.resize(latency_index + 1);
+  latency_records[0] = latency_cnt[0] = 0;
+  for (const auto& sec_latency_record : sec_latency_records) {
+    latency_records[sec_latency_record.first] += sec_latency_record.second;
+    latency_cnt[sec_latency_record.first]++;
+  }
+  for (size_t i = 1; i < latency_records.size(); i++) {
+    latency_records[i] /= latency_cnt[i];
+  }
+  for (const auto& sec_bytes_record : sec_bytes_records) {
+    bytes_records[sec_bytes_record.first] += sec_bytes_record.second;
+  }
+  long double total_avg_latency = 0;
+  long double total_bytes = 0;
+  for (double latency_record : latency_records) {
+    total_avg_latency += latency_record;
+  }
+  total_avg_latency = total_avg_latency / (latency_records.size() - 1);
+  for (double bytes_record : bytes_records) {
+    total_bytes += bytes_record;
+  }
+  total_bytes = total_bytes / bytes_records.size();  // per sec
+  // P99
+  std::sort(P99_latency, P99_latency + ops_num);
+  uint64_t P99 = P99_latency[size_t(1.0 * ops_num * 99 / 100)];
+
+  // output
+  std::ofstream file("/tmp/write_latency_stats.log",
+                     std::ios::app | std::ios::out);
+  if (file.is_open()) {
+    file << "total_avg_latency: " << total_avg_latency << std::endl;
+    file << "total_bytes: " << total_bytes << std::endl;
+    file << "P99 latency: " << P99 << std::endl;
+    file << "P50 latency per second:(ms/op)" << std::endl;
+    for (size_t i = 0; i < latency_records.size(); i++) {
+      file << i << " " << latency_records[i] << std::endl;
+    }
+    file << "output per second:(MB/s)" << std::endl;
+    for (size_t i = 0; i < bytes_records.size(); i++) {
+      file << i << " " << bytes_records[i] << std::endl;
+    }
+
+    file.flush();
+    file.close();
+  } else {
+    std::cerr << "dump latency&speed stats data failed" << std::endl;
+  }
+}
 // State shared by all concurrent executions of the same benchmark.
 struct SharedState {
   port::Mutex mu;
@@ -2590,6 +2688,13 @@ struct SharedState {
   long num_initialized;
   long num_done;
   bool start;
+
+  std::once_flag start_flag;
+  port::Mutex latency_mutex;
+  uint64_t* P99_latency;
+  std::vector<std::pair<size_t, double>> sec_latency_records_;
+  std::vector<std::pair<size_t, double>> sec_bytes_records_;
+  uint64_t ops_num = 0;
 
   SharedState() : cv(&mu), perf_level(FLAGS_perf_level) {}
 };
@@ -3204,9 +3309,11 @@ class Benchmark {
 
     int bytes_to_fill = std::min(key_size_ - static_cast<int>(pos - start), 8);
     if (port::kLittleEndian) {
-      for (int i = 0; i < bytes_to_fill; ++i) {
-        pos[i] = (v >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
-      }
+      // note: use big-endian to make it easier to seperate keys
+      // for (int i = 0; i < bytes_to_fill; ++i) {
+      //   pos[i] = (v >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
+      // }
+      memcpy(pos, static_cast<void*>(&v), bytes_to_fill);
     } else {
       memcpy(pos, static_cast<void*>(&v), bytes_to_fill);
     }
@@ -3400,6 +3507,11 @@ class Benchmark {
           num_threads = 1;
         }
         method = &Benchmark::WriteUniqueRandom;
+      } else if (name == "ycsbworkloadzipfian") {
+        method = &Benchmark::YCSBZipfian;
+      } else if (name == "ycsbworkloadlatest") {
+        method = &Benchmark::YCSBLatest;  // zipfian distribution, 50%
+                                          // reads and 50% updates
       } else if (name == "overwrite") {
         method = &Benchmark::WriteRandom;
       } else if (name == "fillsync") {
@@ -3835,6 +3947,13 @@ class Benchmark {
                                              FLAGS_report_interval_seconds));
     }
 
+    if (FLAGS_report_fillrandom_latency_and_load) {
+      shared.P99_latency = new uint64_t[FLAGS_num * n];
+    }
+    if (FLAGS_track_flush_compaction_stats) {
+      Singleton<rf_stats>::GetInstance()->Start(Env::Default()->NowMicros());
+    }
+
     ThreadArg* arg = new ThreadArg[n];
 
     for (int i = 0; i < n; i++) {
@@ -3883,6 +4002,16 @@ class Benchmark {
       merge_stats.Merge(arg[i].thread->stats);
     }
     merge_stats.Report(name);
+
+    if (FLAGS_track_flush_compaction_stats) {
+      Singleton<rf_stats>::GetInstance()->End(Env::Default()->NowMicros());
+      Singleton<rf_stats>::GetInstance()->Report();
+    }
+    ReportV2(shared.sec_latency_records_, shared.sec_bytes_records_,
+             shared.P99_latency, shared.ops_num);
+    if (FLAGS_report_fillrandom_latency_and_load) {
+      delete[] shared.P99_latency;
+    }
 
     for (int i = 0; i < n; i++) {
       delete arg[i].thread;
@@ -4079,6 +4208,7 @@ class Benchmark {
     options.arena_block_size = FLAGS_arena_block_size;
     options.write_buffer_size = FLAGS_write_buffer_size;
     options.max_write_buffer_number = FLAGS_max_write_buffer_number;
+    options.max_local_write_buffer_number = FLAGS_max_local_write_buffer_number;
     options.min_write_buffer_number_to_merge =
         FLAGS_min_write_buffer_number_to_merge;
     options.max_write_buffer_number_to_maintain =
@@ -4137,6 +4267,9 @@ class Benchmark {
         FLAGS_level_compaction_dynamic_level_bytes;
     options.max_bytes_for_level_multiplier =
         FLAGS_max_bytes_for_level_multiplier;
+    options.server_remote_flush = FLAGS_use_remote_flush;
+    options.max_local_write_buffer_number = FLAGS_max_local_write_buffer_number;
+
     Status s =
         CreateMemTableRepFactory(config_options, &options.memtable_factory);
     if (!s.ok()) {
@@ -4701,6 +4834,29 @@ class Benchmark {
     }
 
     InitializeOptionsGeneral(opts);
+
+    if (FLAGS_use_remote_flush) {
+      size_t port = FLAGS_memnode_port;
+      std::string ip = FLAGS_memnode_ip;
+      int32_t heartbeat_port = FLAGS_memnode_heartbeat_port;
+      db_.db->register_memnode(ip, port);
+      std::string local_ip = FLAGS_local_ip;
+      db_.db->register_local_ip(local_ip);
+      std::call_once(remote_flush_port_once, []() {
+        pd_client = new PDClient(FLAGS_memnode_heartbeat_port);
+        pd_client->match_memnode_for_request(FLAGS_memnode_ip);
+      });
+      db_.db->register_pd_client(pd_client);
+    }
+
+    // if (FLAGS_use_single_thread_pool) {
+    //   FLAGS_env->SetBackgroundThreads(FLAGS_num_high_pri_threads,
+    //                                   ROCKSDB_NAMESPACE::Env::Priority::HIGH);
+    //   FLAGS_env->SetBackgroundThreads(FLAGS_num_bottom_pri_threads,
+    //                                   ROCKSDB_NAMESPACE::Env::Priority::BOTTOM);
+    //   FLAGS_env->SetBackgroundThreads(FLAGS_num_low_pri_threads,
+    //                                   ROCKSDB_NAMESPACE::Env::Priority::LOW);
+    // }
   }
 
   void OpenDb(Options options, const std::string& db_name,
@@ -4851,7 +5007,7 @@ class Benchmark {
     }
   }
 
-  enum WriteMode { RANDOM, SEQUENTIAL, UNIQUE_RANDOM };
+  enum WriteMode { RANDOM, RANDOM_U64, SEQUENTIAL, UNIQUE_RANDOM };
 
   void WriteSeqDeterministic(ThreadState* thread) {
     DoDeterministicCompact(thread, open_options_.compaction_style, SEQUENTIAL);
@@ -4864,7 +5020,7 @@ class Benchmark {
 
   void WriteSeq(ThreadState* thread) { DoWrite(thread, SEQUENTIAL); }
 
-  void WriteRandom(ThreadState* thread) { DoWrite(thread, RANDOM); }
+  void WriteRandom(ThreadState* thread) { DoWrite(thread, RANDOM_U64); }
 
   void WriteUniqueRandom(ThreadState* thread) {
     DoWrite(thread, UNIQUE_RANDOM);
@@ -4894,6 +5050,8 @@ class Benchmark {
         case SEQUENTIAL:
           return next_++;
         case RANDOM:
+          return rand_->Next() % num_;
+        case RANDOM_U64:
           return rand_->Next() % num_;
         case UNIQUE_RANDOM:
           assert(next_ < num_);
@@ -5068,6 +5226,18 @@ class Benchmark {
 
     int64_t stage = 0;
     int64_t num_written = 0;
+
+    std::vector<uint64_t> thread_latency_all;
+    std::vector<double> thread_throughput_per_sec_;
+    std::vector<size_t> imm_sizes;
+    std::vector<double> thread_latency_per_sec_;
+    uint64_t t_start_time = 0;
+    int64_t t_last_num = 0, t_last_bytes = 0;
+    std::call_once(thread->shared->start_flag,
+                   [&]() { t_start_time = Env::Default()->NowMicros(); });
+    uint64_t t_cur_time = t_start_time, per_write_start_time = 0,
+             count_now_latency = 0, t_last_time = t_start_time;
+
     int64_t next_seq_db_at = num_ops;
     size_t id = 0;
     int64_t num_range_deletions = 0;
@@ -5310,6 +5480,10 @@ class Benchmark {
         // once per write.
         thread->stats.ResetLastOpTime();
       }
+      if (FLAGS_report_fillrandom_latency_and_load) {  // entries_per_batch_
+                                                       // need equal 1
+        per_write_start_time = FLAGS_env->NowMicros();
+      }
       if (user_timestamp_size_ > 0) {
         Slice user_ts = mock_app_clock_->Allocate(ts_guard.get());
         s = batch.UpdateTimestamps(
@@ -5323,6 +5497,13 @@ class Benchmark {
       if (!use_blob_db_) {
         // Not stacked BlobDB
         s = db_with_cfh->db->Write(write_options_, &batch);
+      }
+      if (FLAGS_report_fillrandom_latency_and_load) {  // entries_per_batch_
+                                                       // need equal 1
+        uint64_t latency = FLAGS_env->NowMicros() -
+                           per_write_start_time;  // current op's latency
+        count_now_latency += latency;
+        thread_latency_all.push_back(latency);
       }
       thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db,
                                 entries_per_batch_, kWrite);
@@ -5355,7 +5536,46 @@ class Benchmark {
         fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         ErrorExit();
       }
+      t_cur_time = Env::Default()->NowMicros();
+      if (1.0 * (t_cur_time - t_last_time) > 1e6 &&
+          FLAGS_report_fillrandom_latency_and_load) {  // per second
+        double use_time = 1e-6 * (t_cur_time - t_last_time);
+        int64_t ebytes = bytes - t_last_bytes;
+        int64_t written_num = num_written - t_last_num;
+        size_t imm_size = static_cast_with_check<ColumnFamilyHandleImpl>(
+                              db_with_cfh->db->DefaultColumnFamily())
+                              ->cfd()
+                              ->imm()
+                              ->current()
+                              ->imm_size();
+        thread_throughput_per_sec_.push_back((1.0 * ebytes / 1048576.0) /
+                                             use_time);
+        imm_sizes.push_back(imm_size);
+        thread_latency_per_sec_.push_back(1.0 * count_now_latency /
+                                          (1.0 * written_num));
+
+        t_last_time = t_cur_time;
+        t_last_bytes = bytes;
+        t_last_num = num_written;
+        count_now_latency = 0;
+      }
     }
+
+    size_t randnum = rand() % 10000;
+    std::ofstream file("/tmp/memsize_" + std::to_string(randnum) + "_" +
+                           std::to_string(FLAGS_threads) + ".log",
+                       std::ios::app | std::ios::out);
+    if (file.is_open()) {
+      file << "Imm Size:" << std::endl;
+      for (auto& v : imm_sizes) {
+        file << v << std::endl;
+      }
+      file.flush();
+      file.close();
+    } else {
+      std::cerr << "dump immsize stats data failed" << std::endl;
+    }
+
     if ((write_mode == UNIQUE_RANDOM) && (p > 0.0)) {
       fprintf(stdout,
               "Number of unique keys inserted: %" PRIu64
@@ -5372,6 +5592,191 @@ class Benchmark {
                 << std::endl;
     }
     thread->stats.AddBytes(bytes);
+
+    thread->shared->latency_mutex.Lock();
+    for (size_t i = 0; i < thread_latency_per_sec_.size(); i++) {
+      thread->shared->sec_latency_records_.emplace_back(
+          i + 1, thread_latency_per_sec_[i]);
+    }
+    for (size_t i = 0; i < thread_throughput_per_sec_.size(); i++) {
+      thread->shared->sec_bytes_records_.emplace_back(
+          i + 1, thread_throughput_per_sec_[i]);
+    }
+    for (unsigned long i : thread_latency_all) {
+      thread->shared->P99_latency[thread->shared->ops_num++] = i;
+    }
+    thread->shared->latency_mutex.Unlock();
+  }
+
+  // Workload A: Update heavy workload
+  // This workload has a mix of 50/50 reads and writes.
+  // An application example is a session store recording recent actions.
+  // Read/update ratio: 50/50
+  // Default data size: 1 KB records
+  // Request distribution: zipfian
+  void YCSBZipfian(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+
+    ZipfGenerator zipf_generator;
+    zipf_generator.init_zipf_generator(0, FLAGS_num);
+
+    std::string value;
+    int64_t found = 0;
+    uint64_t per_op_start_time = 0;
+
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, FLAGS_ycsb_workload_num);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    if (FLAGS_benchmark_write_rate_limit > 0) {
+      printf(">>>> FLAGS_benchmark_write_rate_limit YCSBA \n");
+      thread->shared->write_rate_limiter.reset(
+          NewGenericRateLimiter(FLAGS_benchmark_write_rate_limit));
+    }
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_ycsb_uniform_distribution) {
+        // Generate number from uniform distribution
+        k = thread->rand.Next() % FLAGS_num;
+      } else {  // default
+        // Generate number from zipf distribution
+        k = zipf_generator.nextValue() % FLAGS_num;
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < FLAGS_readwritepercent) {
+        // read
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "k=%ld; get error: %s\n", k, s.ToString().c_str());
+          // exit(1);
+          //  we continue after error rather than exiting so that we can
+          //  find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          // thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        }
+        thread->stats.FinishedOps(nullptr, db, 1,
+                                  kRead);  // not found is normal operation
+        reads_done++;
+
+      } else {
+        // write
+        if (FLAGS_benchmark_write_rate_limit > 0) {
+          thread->shared->write_rate_limiter->Request(
+              value_size + key_size_, Env::IO_HIGH, nullptr /* stats */,
+              RateLimiter::OpType::kWrite);
+          thread->stats.ResetLastOpTime();
+        }
+
+        Status s = db->Put(write_options_, key, gen.Generate(value_size));
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          // exit(1);
+        } else {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "( reads:%" PRIu64 " writes:%" PRIu64 " total:%" PRIu64
+             " found:%" PRIu64 ")",
+             reads_done, writes_done, FLAGS_ycsb_workload_num, found);
+    thread->stats.AddMessage(msg);
+  }
+
+  void YCSBLatest(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+
+    ZipfGenerator latest_generator;
+    latest_generator.init_latest_generator(0, 100 + thread->tid * FLAGS_num);
+
+    std::string value;
+    int64_t found = 0;
+    uint64_t per_op_start_time = 0;
+
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, FLAGS_num);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    if (FLAGS_benchmark_write_rate_limit > 0) {
+      printf(">>>> FLAGS_benchmark_write_rate_limit YCSBA \n");
+      thread->shared->write_rate_limiter.reset(
+          NewGenericRateLimiter(FLAGS_benchmark_write_rate_limit));
+    }
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+
+      long k;
+      if (FLAGS_ycsb_uniform_distribution) {
+        // Generate number from uniform distribution
+        k = thread->rand.Next() % FLAGS_num;
+      } else {  // default
+        // Generate number from zipf distribution
+        k = latest_generator.nextLatestValue() % FLAGS_num;
+        // fprintf(stderr, "%ld\n", k);
+      }
+      GenerateKeyFromInt(k, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < FLAGS_readwritepercent) {
+        // read
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "k=%ld; get error: %s\n", k, s.ToString().c_str());
+          // exit(1);
+          //  we continue after error rather than exiting so that we can
+          //  find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+          // thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        }
+        thread->stats.FinishedOps(nullptr, db, 1,
+                                  kRead);  // not found is normal operation
+        reads_done++;
+
+      } else {
+        // write
+        if (FLAGS_benchmark_write_rate_limit > 0) {
+          thread->shared->write_rate_limiter->Request(
+              value_size + key_size_, Env::IO_HIGH, nullptr /* stats */,
+              RateLimiter::OpType::kWrite);
+          thread->stats.ResetLastOpTime();
+        }
+
+        Status s = db->Put(write_options_, key, gen.Generate(value_size));
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          // exit(1);
+        } else {
+          writes_done++;
+          thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+        }
+      }
+    }
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "( reads:%" PRIu64 " writes:%" PRIu64 " total:%" PRIu64
+             " found:%" PRIu64 ")",
+             reads_done, writes_done, FLAGS_ycsb_workload_num, found);
+    thread->stats.AddMessage(msg);
   }
 
   Status DoDeterministicCompact(ThreadState* thread,
@@ -8317,7 +8722,6 @@ class Benchmark {
     }
   }
 
-
   void Replay(ThreadState* thread) {
     if (db_.db != nullptr) {
       Replay(thread, &db_);
@@ -8405,7 +8809,6 @@ class Benchmark {
     assert(s.ok());
     delete backup_engine;
   }
-
 };
 
 int db_bench_tool(int argc, char** argv) {

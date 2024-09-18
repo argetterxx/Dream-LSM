@@ -12,8 +12,11 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <cstdint>
 
 #include "rocksdb/convenience.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
@@ -24,6 +27,16 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 
 class FixedPrefixTransform : public SliceTransform {
+ public:
+  int64_t identifier() const override {
+    return (((int64_t)prefix_len_) << 8) | 1;
+  }
+  void PackLocal(TransferService* node) const override {
+    LOG("FixedPrefixTransform::PackLocal");
+    std::pair<uint8_t, size_t> msg(1, prefix_len_);
+    node->send(&msg, sizeof(msg));
+  }
+
  private:
   size_t prefix_len_;
   std::string id_;
@@ -77,6 +90,14 @@ class FixedPrefixTransform : public SliceTransform {
 };
 
 class CappedPrefixTransform : public SliceTransform {
+ public:
+  int64_t identifier() const override { return (((int64_t)cap_len_) << 8) | 2; }
+  void PackLocal(TransferService* node) const override {
+    LOG("CappedPrefixTransform::PackLocal");
+    std::pair<uint8_t, size_t> msg(2, cap_len_);
+    node->send(&msg, sizeof(msg));
+  }
+
  private:
   size_t cap_len_;
   std::string id_;
@@ -127,6 +148,14 @@ class CappedPrefixTransform : public SliceTransform {
 };
 
 class NoopTransform : public SliceTransform {
+ public:
+  int64_t identifier() const override { return 3; }
+  void PackLocal(TransferService* node) const override {
+    LOG("NoopTransform::PackLocal");
+    std::pair<uint8_t, size_t> msg(3, 0);
+    node->send(&msg, sizeof(msg));
+  }
+
  public:
   explicit NoopTransform() {}
 

@@ -14,6 +14,7 @@
 #include "logging/logging.h"
 #include "monitoring/perf_context_imp.h"
 #include "options/options_helper.h"
+#include "rocksdb/file_system.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
 
@@ -258,7 +259,6 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       return s;
     }
   }
-
   if (two_write_queues_ && disable_memtable) {
     AssignOrder assign_order =
         seq_per_batch_ ? kDoAssignOrder : kDontAssignOrder;
@@ -2276,11 +2276,17 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
   cfd->mem()->SetNextLogNumber(logfile_number_);
   assert(new_mem != nullptr);
   cfd->imm()->Add(cfd->mem(), &context->memtables_to_free_);
+  if (cfd->initial_cf_options().max_write_buffer_number >
+      cfd->initial_cf_options().max_local_write_buffer_number) {
+    cfd->register_imm_trans(cfd->mem(), true);
+  } else if (cfd->initial_cf_options().server_use_remote_flush) {
+    cfd->register_imm_trans(cfd->mem(), true);
+  }
+
   new_mem->Ref();
   cfd->SetMemtable(new_mem);
   InstallSuperVersionAndScheduleWork(cfd, &context->superversion_context,
                                      mutable_cf_options);
-
   // Notify client that memtable is sealed, now that we have successfully
   // installed a new memtable
   NotifyOnMemTableSealed(cfd, memtable_info);

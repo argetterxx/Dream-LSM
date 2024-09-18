@@ -9,9 +9,12 @@
 
 #include "memory/concurrent_arena.h"
 
+#include <sys/socket.h>
+
 #include <thread>
 
 #include "port/port.h"
+#include "rocksdb/remote_flush_service.h"
 #include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -27,10 +30,11 @@ const size_t kMaxShardBlockSize = size_t{128 * 1024};
 }  // namespace
 
 ConcurrentArena::ConcurrentArena(size_t block_size, AllocTracker* tracker,
-                                 size_t huge_page_size)
+                                 size_t huge_page_size, RDMAClient* client,
+                                 RDMANode::rdma_connection* conn)
     : shard_block_size_(std::min(kMaxShardBlockSize, block_size / 8)),
       shards_(),
-      arena_(block_size, tracker, huge_page_size) {
+      arena_(block_size, tracker, huge_page_size, client, conn) {
   Fixup();
 }
 
@@ -40,6 +44,16 @@ ConcurrentArena::Shard* ConcurrentArena::Repick() {
   // have repicked
   tls_cpuid = shard_and_index.second | shards_.Size();
   return shard_and_index.first;
+}
+
+void ConcurrentArena::PackLocal(TransferService* node) const {
+  int msg = 1;
+  node->send(&msg, sizeof(int));
+}
+
+void* ConcurrentArena::UnPackLocal(TransferService*) {
+  void* arena = reinterpret_cast<void*>(new ConcurrentArena());
+  return arena;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -7,13 +7,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include "rocksdb/env.h"
 #ifdef ROCKSDB_LIB_IO_POSIX
-#include "env/io_posix.h"
-
 #include <errno.h>
 #include <fcntl.h>
 
 #include <algorithm>
+
+#include "env/io_posix.h"
 #if defined(OS_LINUX)
 #include <linux/fs.h>
 #ifndef FALLOC_FL_KEEP_SIZE
@@ -1270,8 +1271,10 @@ IOStatus PosixMmapFile::Allocate(uint64_t offset, uint64_t len,
  */
 PosixWritableFile::PosixWritableFile(const std::string& fname, int fd,
                                      size_t logical_block_size,
-                                     const EnvOptions& options)
+                                     const EnvOptions& options,
+                                     FileSystem::SlidingWindow* window)
     : FSWritableFile(options),
+      writeWindow_(window),
       filename_(fname),
       use_direct_io_(options.use_direct_writes),
       fd_(fd),

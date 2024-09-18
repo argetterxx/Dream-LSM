@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -26,8 +27,8 @@
 #include "rocksdb/customizable.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
+#include "rocksdb/remote_flush_service.h"
 #include "rocksdb/status.h"
-
 namespace ROCKSDB_NAMESPACE {
 
 // -- Block-based Table
@@ -671,7 +672,6 @@ struct BlockBasedTablePropertyNames {
 extern TableFactory* NewBlockBasedTableFactory(
     const BlockBasedTableOptions& table_options = BlockBasedTableOptions());
 
-
 enum EncodingType : char {
   // Always write full keys without any special encoding.
   kPlain,
@@ -827,11 +827,16 @@ struct CuckooTableOptions {
 extern TableFactory* NewCuckooTableFactory(
     const CuckooTableOptions& table_options = CuckooTableOptions());
 
-
 class RandomAccessFileReader;
 
 // A base class for table factories.
 class TableFactory : public Customizable {
+ public:
+  virtual void PackLocal(TransferService*) const {
+    LOG("TableFactory::PackLocal not implemented");
+    assert(false);
+  }
+
  public:
   virtual ~TableFactory() override {}
 
@@ -923,5 +928,38 @@ extern TableFactory* NewAdaptiveTableFactory(
     std::shared_ptr<TableFactory> plain_table_factory = nullptr,
     std::shared_ptr<TableFactory> cuckoo_table_factory = nullptr);
 
+class TablePackFactory {
+ public:
+  static void* UnPackLocal(TransferService* node);
+
+ public:
+  TablePackFactory& operator=(const TablePackFactory&) = delete;
+  TablePackFactory& operator=(TablePackFactory&&) = delete;
+  TablePackFactory(const TablePackFactory&) = delete;
+
+ private:
+  TablePackFactory() = default;
+  ~TablePackFactory() = default;
+};
+
+inline void* TablePackFactory::UnPackLocal(TransferService* node) {
+  size_t msg = 0;
+  node->receive(&msg, sizeof(msg));
+  if (msg == 0) {
+    LOG("TablePackFactory::UnPackLocal: msg == 0 : nullptr");
+    return nullptr;
+  }
+  if (msg == 0x01) {
+    return NewBlockBasedTableFactory();
+  } else if (msg == 0x02) {
+    return NewCuckooTableFactory();
+  } else if (msg == 0x03) {
+    return NewPlainTableFactory();
+  } else {
+    LOG("TablePackFactory::UnPackLocal: msg: ", msg);
+    assert(false);
+  }
+  return nullptr;
+}
 
 }  // namespace ROCKSDB_NAMESPACE

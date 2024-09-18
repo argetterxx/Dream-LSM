@@ -20,6 +20,8 @@ public enum OperationStage {
   STAGE_PICK_MEMTABLES_TO_FLUSH((byte)0x8),
   STAGE_MEMTABLE_ROLLBACK((byte)0x9),
   STAGE_MEMTABLE_INSTALL_FLUSH_RESULTS((byte)0xA);
+  STAGE_REMOTE_FLUSH_RUN((byte) 0xB);
+  STAGE_REMOTE_FLUSH_WRITE_L0((byte) 0xC);
 
   private final byte value;
 

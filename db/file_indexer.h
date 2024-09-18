@@ -78,7 +78,8 @@ class FileIndexer {
     //     provide left bound.
     //     Precalculated index based on "largest < smallest" can be used to
     //     provide right bound.
-    // (3) key is larger than largest, implying it is also larger than smallest.
+    // (3) key is larger than largest, implying it is also larger than
+    // smallest.
     //     Precalculated index based on "largest > largest" can be used to
     //     provide left bound.
     //
@@ -96,8 +97,8 @@ class FileIndexer {
     // A key 53, sits in the middle 50 and 60. 1st file on level 2 can be
     // skipped according to rule (2)-a, but the 3rd file cannot be skipped
     // because 60 is greater than 58. LB = 1, RB = 2.
-    // A key 70, compared to be larger than 60. 1st and 2nd file can be skipped
-    // according to rule (3). LB = 2, RB = 2.
+    // A key 70, compared to be larger than 60. 1st and 2nd file can be
+    // skipped according to rule (3). LB = 2, RB = 2.
     //
     // Point to a left most file in a lower level that may contain a key,
     // which compares greater than smallest of a FileMetaData (upper level)

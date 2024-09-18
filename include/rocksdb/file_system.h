@@ -17,9 +17,12 @@
 #pragma once
 
 #include <stdint.h>
+#include <unistd.h>
 
+#include <cassert>
 #include <chrono>
 #include <cstdarg>
+#include <cstddef>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -31,7 +34,9 @@
 #include "rocksdb/customizable.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/macro.hpp"
 #include "rocksdb/options.h"
+#include "rocksdb/remote_flush_service.h"
 #include "rocksdb/table.h"
 #include "rocksdb/thread_status.h"
 
@@ -84,6 +89,23 @@ enum class IOType : uint8_t {
 // honored. More hints can be added here in the future to indicate things like
 // storage media (HDD/SSD) to be used, replication level etc.
 struct IOOptions {
+ public:
+  void PackLocal(TransferService* node) const {
+    assert(property_bag.empty());
+    // assert(timeout.count() >= 0);
+    size_t timeout_ = timeout.count();
+    node->send(&timeout_, sizeof(size_t));
+    node->send(reinterpret_cast<const void*>(this), sizeof(IOOptions));
+  }
+  static void* UnPackLocal(TransferService* node) {
+    void* mem = malloc(sizeof(IOOptions));
+    size_t timeout_ = 0;
+    node->receive(&timeout_, sizeof(size_t));
+    node->receive(mem, sizeof(IOOptions));
+    auto ptr = reinterpret_cast<IOOptions*>(mem);
+    new (&ptr->timeout) std::chrono::microseconds(timeout_);
+    return mem;
+  }
   // Timeout for the operation in microseconds
   std::chrono::microseconds timeout;
 
@@ -150,6 +172,24 @@ struct DirFsyncOptions {
 // while its open. We may add more options here in the future such as
 // redundancy level, media to use etc.
 struct FileOptions : EnvOptions {
+ public:
+  void PackLocal(TransferService* node) const {
+    io_options.PackLocal(node);
+    node->send(&temperature, sizeof(Temperature));
+    node->send(&handoff_checksum_type, sizeof(ChecksumType));
+  }
+  static void* UnPackLocal(TransferService* node) {
+    auto* local_io_options =
+        reinterpret_cast<IOOptions*>(IOOptions::UnPackLocal(node));
+    void* mem = new FileOptions(EnvOptions());
+    auto local_file_options = reinterpret_cast<FileOptions*>(mem);
+    new (&local_file_options->io_options) IOOptions(*local_io_options);
+    free(reinterpret_cast<void*>(local_io_options));
+    node->receive(&(local_file_options->temperature), sizeof(Temperature));
+    node->receive(&(local_file_options->handoff_checksum_type),
+                  sizeof(ChecksumType));
+    return mem;
+  }
   // Embedded IOOptions to control the parameters for any IOs that need
   // to be issued for the file open/creation
   IOOptions io_options;
@@ -268,6 +308,49 @@ class FileSystem : public Customizable {
   FileSystem(const FileSystem&) = delete;
 
   virtual ~FileSystem();
+  virtual int get_writein_speed() {
+    printf("get_writein_speed is not implemented in this FileSystem\n");
+    assert(false);
+    return 0;
+  }
+  struct SlidingWindow {
+   private:
+    struct Entry {
+      std::chrono::time_point<std::chrono::system_clock> time;
+      int size;
+    };
+    std::deque<Entry> window;
+    int totalSize;
+    mutable std::mutex wmtx_;
+
+   public:
+    SlidingWindow() : totalSize(0) {}
+    void write(const std::chrono::time_point<std::chrono::system_clock>& time,
+               int size) {
+      std::lock_guard<std::mutex> lock(wmtx_);
+      window.push_back({time, size});
+      totalSize += size;
+      auto expireTime = time - std::chrono::seconds(1);
+      while (!window.empty() && window.front().time < expireTime) {
+        totalSize -= window.front().size;
+        window.pop_front();
+      }
+    }
+    int get(const std::chrono::time_point<std::chrono::system_clock>& time) {
+      std::lock_guard<std::mutex> lock(wmtx_);
+      auto expireTime = time - std::chrono::seconds(1);
+      while (!window.empty() && window.front().time < expireTime) {
+        totalSize -= window.front().size;
+        window.pop_front();
+      }
+      return totalSize;
+    }
+  };
+  virtual SlidingWindow* get_sliding_window() {
+    printf("get_sliding_window is not implemented in this FileSystem\n");
+    assert(false);
+    return nullptr;
+  }
 
   static const char* Type() { return "FileSystem"; }
   static const char* kDefaultName() { return "DefaultFileSystem"; }
@@ -1326,7 +1409,9 @@ class FileSystemWrapper : public FileSystem {
 
   // Return the target to which this Env forwards all calls
   FileSystem* target() const { return target_.get(); }
-
+  FileSystem::SlidingWindow* get_sliding_window() override {
+    return target_->get_sliding_window();
+  }
   // The following text is boilerplate that forwards all methods to target()
   IOStatus NewSequentialFile(const std::string& f, const FileOptions& file_opts,
                              std::unique_ptr<FSSequentialFile>* r,
@@ -1527,6 +1612,9 @@ class FileSystemWrapper : public FileSystem {
   }
 
   virtual bool use_async_io() override { return target_->use_async_io(); }
+  virtual int get_writein_speed() override {
+    return target_->get_writein_speed();
+  }
 
  protected:
   std::shared_ptr<FileSystem> target_;

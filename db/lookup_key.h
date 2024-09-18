@@ -23,7 +23,7 @@ class LookupKey {
   // the specified sequence number.
   LookupKey(const Slice& _user_key, SequenceNumber sequence,
             const Slice* ts = nullptr);
-
+  LookupKey(const char* start_, size_t memtable_key_len);
   ~LookupKey();
 
   // Return a key suitable for lookup in a MemTable.

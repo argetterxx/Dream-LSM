@@ -7,6 +7,10 @@
 
 #include <cassert>
 #include <cinttypes>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iterator>
 #include <limits>
 #include <string>
 
@@ -25,9 +29,11 @@
 #include "rocksdb/file_system.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/options.h"
+#include "rocksdb/rate_limiter.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
+#include "table/mock_table.h"
 #include "util/cast_util.h"
 
 // NOTE: in this file, many option flags that were deprecated
@@ -955,9 +961,9 @@ uint64_t MultiplyCheckOverflow(uint64_t op1, double op2) {
 // when level_compaction_dynamic_level_bytes is true and leveled compaction
 // is used, the base level is not always L1, so precomupted max_file_size can
 // no longer be used. Recompute file_size_for_level from base level.
-uint64_t MaxFileSizeForLevel(const MutableCFOptions& cf_options,
-    int level, CompactionStyle compaction_style, int base_level,
-    bool level_compaction_dynamic_level_bytes) {
+uint64_t MaxFileSizeForLevel(const MutableCFOptions& cf_options, int level,
+                             CompactionStyle compaction_style, int base_level,
+                             bool level_compaction_dynamic_level_bytes) {
   if (!level_compaction_dynamic_level_bytes || level < base_level ||
       compaction_style != kCompactionStyleLevel) {
     assert(level >= 0);

@@ -59,8 +59,6 @@
 //   Store per-table metadata (smallest, largest, largest-seq#, ...)
 //   in the table's meta section to speed up ScanTable.
 
-#include "db/version_builder.h"
-
 #include <cinttypes>
 
 #include "db/builder.h"
@@ -70,6 +68,7 @@
 #include "db/log_writer.h"
 #include "db/memtable.h"
 #include "db/table_cache.h"
+#include "db/version_builder.h"
 #include "db/version_edit.h"
 #include "db/write_batch_internal.h"
 #include "file/filename.h"
@@ -200,6 +199,7 @@ class Repairer {
         ArchiveFile(dbname_ + "/" + manifests_[i]);
       }
       // Just create a DBImpl temporarily so we can reuse NewDB()
+      // TODO(iaIm14): remove ColumnFamilyOptions()
       db_impl = new DBImpl(db_options_, dbname_);
       status = db_impl->NewDB(/*new_filenames=*/nullptr);
     }
@@ -809,4 +809,3 @@ Status RepairDB(const std::string& dbname, const Options& options) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

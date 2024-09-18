@@ -10,6 +10,7 @@
 #include "env/mock_env.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 
 #include "env/emulated_clock.h"
@@ -1053,6 +1054,5 @@ Status MockEnv::CorruptBuffer(const std::string& fname) {
 
 // This is to maintain the behavior before swithcing from InMemoryEnv to MockEnv
 Env* NewMemEnv(Env* base_env) { return MockEnv::Create(base_env); }
-
 
 }  // namespace ROCKSDB_NAMESPACE

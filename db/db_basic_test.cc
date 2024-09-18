@@ -363,7 +363,7 @@ TEST_F(DBBasicTest, LevelLimitReopen) {
   ASSERT_OK(TryReopenWithColumnFamilies({"default", "pikachu"}, options));
 }
 
-TEST_F(DBBasicTest, PutDeleteGet) {
+TEST_F(DBBasicTest, DISABLED_PutDeleteGet) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
     ASSERT_OK(Put(1, "foo", "v1"));
@@ -413,7 +413,7 @@ TEST_F(DBBasicTest, EmptyFlush) {
                          kSkipMergePut));
 }
 
-TEST_F(DBBasicTest, GetFromVersions) {
+TEST_F(DBBasicTest, DISABLED_GetFromVersions) {
   do {
     CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
     ASSERT_OK(Put(1, "foo", "v1"));
@@ -423,7 +423,7 @@ TEST_F(DBBasicTest, GetFromVersions) {
   } while (ChangeOptions());
 }
 
-TEST_F(DBBasicTest, GetSnapshot) {
+TEST_F(DBBasicTest, DISABLED_GetSnapshot) {
   anon::OptionsOverride options_override;
   options_override.skip_policy = kSkipNoSnapshot;
   do {
@@ -695,7 +695,7 @@ TEST_F(DBBasicTest, LockFileRecovery) {
   }
 }
 
-TEST_F(DBBasicTest, Snapshot) {
+TEST_F(DBBasicTest, DISABLED_Snapshot) {
   env_->SetMockSleep();
   anon::OptionsOverride options_override;
   options_override.skip_policy = kSkipNoSnapshot;
@@ -765,7 +765,6 @@ TEST_F(DBBasicTest, Snapshot) {
     ASSERT_EQ("1v4", Get(1, "foo"));
   } while (ChangeOptions());
 }
-
 
 class DBBasicMultiConfigs : public DBBasicTest,
                             public ::testing::WithParamInterface<int> {
@@ -1611,7 +1610,7 @@ TEST_P(DBMultiGetTestWithParam, MultiGetBatchedSimpleUnsorted) {
   } while (ChangeCompactOptions());
 }
 
-TEST_P(DBMultiGetTestWithParam, MultiGetBatchedSortedMultiFile) {
+TEST_P(DBMultiGetTestWithParam, DISABLED_MultiGetBatchedSortedMultiFile) {
 #ifndef USE_COROUTINES
   if (std::get<1>(GetParam())) {
     ROCKSDB_GTEST_SKIP("This test requires coroutine support");

@@ -32,6 +32,15 @@ enum OptionSection : char {
 static const std::string opt_section_titles[] = {
     "Version", "DBOptions", "CFOptions", "TableOptions/", "Unknown"};
 
+Status MemPersistRocksDBOptions(const DBOptions& db_opt,
+                                const std::vector<std::string>& cf_names,
+                                const std::vector<ColumnFamilyOptions>& cf_opts,
+                                std::string& writer);
+Status MemPersistRocksDBOptions(const ConfigOptions& config_options_in,
+                                const DBOptions& db_opt,
+                                const std::vector<std::string>& cf_names,
+                                const std::vector<ColumnFamilyOptions>& cf_opts,
+                                std::string& writer);
 Status PersistRocksDBOptions(const DBOptions& db_opt,
                              const std::vector<std::string>& cf_names,
                              const std::vector<ColumnFamilyOptions>& cf_opts,
@@ -55,6 +64,8 @@ class RocksDBOptionsParser {
 
   Status Parse(const ConfigOptions& config_options,
                const std::string& file_name, FileSystem* fs);
+
+  Status MemParse(const ConfigOptions& config_options, const std::string& data);
 
   static std::string TrimAndRemoveComment(const std::string& line,
                                           const bool trim_only = false);
@@ -144,6 +155,5 @@ class RocksDBOptionsParser {
   int db_version[3];
   int opt_file_version[3];
 };
-
 
 }  // namespace ROCKSDB_NAMESPACE

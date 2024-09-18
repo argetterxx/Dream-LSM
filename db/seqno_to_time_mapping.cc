@@ -6,10 +6,44 @@
 
 #include "db/seqno_to_time_mapping.h"
 
+#include <sys/socket.h>
+
+#include <cassert>
+#include <cstdint>
+#include <deque>
+
 #include "db/version_edit.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+void SeqnoToTimeMapping::PackLocal(TransferService* node) const {
+  size_t mp_size = seqno_time_mapping_.size();
+  node->send(&mp_size, sizeof(size_t));
+  LOG("server send SeqnoToTimeMapping::mp_size:", mp_size);
+  for (auto& it : seqno_time_mapping_) node->send(&it, sizeof(SeqnoTimePair));
+
+  node->send(reinterpret_cast<const void*>(this), sizeof(SeqnoToTimeMapping));
+}
+
+void* SeqnoToTimeMapping::UnPackLocal(TransferService* node) {
+  void* mem = malloc(sizeof(SeqnoToTimeMapping));
+  size_t mp_size = 0;
+  node->receive(&mp_size, sizeof(size_t));
+  std::deque<SeqnoTimePair> prs;
+  for (size_t i = 0; i < mp_size; i++) {
+    SeqnoTimePair it;
+    node->receive(&it, sizeof(SeqnoTimePair));
+    prs.emplace_back(it);
+  }
+  node->receive(mem, sizeof(SeqnoToTimeMapping));
+  LOG("client send SeqnoToTimeMapping::ret:", mem);
+  auto* mp = reinterpret_cast<SeqnoToTimeMapping*>(mem);
+  mp->seqno_time_mapping_ = prs;
+  return mem;
+}
 
 uint64_t SeqnoToTimeMapping::GetOldestApproximateTime(
     const SequenceNumber seqno) const {

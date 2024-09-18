@@ -44,6 +44,8 @@ Status ValidateOptions(const DBOptions& db_opts,
 
 DBOptions BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
                          const MutableDBOptions& mutable_db_options);
+ImmutableDBOptions BuildImmutableDBOptions(const DBOptions& db_opts);
+MutableDBOptions BuildMutableDBOptions(const DBOptions& db_opts);
 
 ColumnFamilyOptions BuildColumnFamilyOptions(
     const ColumnFamilyOptions& ioptions,

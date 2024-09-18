@@ -16,6 +16,8 @@
 #include "memory/arena.h"
 #include "port/lang.h"
 #include "port/likely.h"
+#include "rocksdb/logger.hpp"
+#include "rocksdb/remote_flush_service.h"
 #include "util/core_local.h"
 #include "util/mutexlock.h"
 #include "util/thread_local.h"
@@ -39,16 +41,27 @@ class Logger;
 // only if ConcurrentArena actually notices concurrent use, and they
 // adjust their size so that there is no fragmentation waste when the
 // shard blocks are allocated from the underlying main arena.
-class ConcurrentArena : public Allocator {
+class ConcurrentArena : public BasicArena {
  public:
+  void PackLocal(TransferService* node) const override;
+  static void* UnPackLocal(TransferService* node);
+  Status SendToRemote() const override { return arena_.SendToRemote(); }
+  void get_remote_page_info(uint64_t* info) const override {
+    arena_.get_remote_page_info(info);
+  }
+
+ public:
+  const char* name() const override { return "ConcurrentArena"; }
   // block_size and huge_page_size are the same as for Arena (and are
   // in fact just passed to the constructor of arena_.  The core-local
   // shards compute their shard_block_size as a fraction of block_size
   // that varies according to the hardware concurrency level.
   explicit ConcurrentArena(size_t block_size = Arena::kMinBlockSize,
                            AllocTracker* tracker = nullptr,
-                           size_t huge_page_size = 0);
-
+                           size_t huge_page_size = 0,
+                           RDMAClient* client = nullptr,
+                           RDMANode::rdma_connection* conn = nullptr);
+  ~ConcurrentArena() override = default;
   char* Allocate(size_t bytes) override {
     return AllocateImpl(bytes, false /*force_arena*/,
                         [this, bytes]() { return arena_.Allocate(bytes); });
@@ -67,26 +80,33 @@ class ConcurrentArena : public Allocator {
                         });
   }
 
-  size_t ApproximateMemoryUsage() const {
+  size_t ApproximateMemoryUsage() const override {
     std::unique_lock<SpinMutex> lock(arena_mutex_, std::defer_lock);
     lock.lock();
     return arena_.ApproximateMemoryUsage() - ShardAllocatedAndUnused();
   }
 
-  size_t MemoryAllocatedBytes() const {
+  size_t MemoryAllocatedBytes() const override {
     return memory_allocated_bytes_.load(std::memory_order_relaxed);
   }
 
-  size_t AllocatedAndUnused() const {
+  size_t AllocatedAndUnused() const override {
     return arena_allocated_and_unused_.load(std::memory_order_relaxed) +
            ShardAllocatedAndUnused();
   }
 
-  size_t IrregularBlockNum() const {
+  size_t IrregularBlockNum() const override {
     return irregular_block_num_.load(std::memory_order_relaxed);
   }
 
   size_t BlockSize() const override { return arena_.BlockSize(); }
+  bool IsInInlineBlock() const override {
+    LOG("should not use this function");
+    assert(false);
+    return false;
+  }
+  size_t RawDataUsage() const override { return arena_.RawDataUsage(); }
+  const void* MemBegin() const override { return arena_.MemBegin(); }
 
  private:
   struct Shard {
@@ -166,14 +186,14 @@ class ConcurrentArena : public Allocator {
       assert(exact == arena_.AllocatedAndUnused());
 
       if (exact >= bytes && arena_.IsInInlineBlock()) {
-        // If we haven't exhausted arena's inline block yet, allocate from arena
-        // directly. This ensures that we'll do the first few small allocations
-        // without allocating any blocks.
-        // In particular this prevents empty memtables from using
-        // disproportionately large amount of memory: a memtable allocates on
-        // the order of 1 KB of memory when created; we wouldn't want to
-        // allocate a full arena block (typically a few megabytes) for that,
-        // especially if there are thousands of empty memtables.
+        // If we haven't exhausted arena's inline block yet, allocate from
+        // arena directly. This ensures that we'll do the first few small
+        // allocations without allocating any blocks. In particular this
+        // prevents empty memtables from using disproportionately large amount
+        // of memory: a memtable allocates on the order of 1 KB of memory when
+        // created; we wouldn't want to allocate a full arena block (typically
+        // a few megabytes) for that, especially if there are thousands of
+        // empty memtables.
         auto rv = func();
         Fixup();
         return rv;

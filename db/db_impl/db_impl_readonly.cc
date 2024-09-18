@@ -12,10 +12,10 @@
 #include "db/merge_context.h"
 #include "logging/logging.h"
 #include "monitoring/perf_context_imp.h"
+#include "rocksdb/configurable.h"
 #include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
-
 
 DBImplReadOnly::DBImplReadOnly(const DBOptions& db_options,
                                const std::string& dbname)
@@ -319,6 +319,5 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
   }
   return s;
 }
-
 
 }  // namespace ROCKSDB_NAMESPACE

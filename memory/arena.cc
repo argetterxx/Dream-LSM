@@ -9,16 +9,32 @@
 
 #include "memory/arena.h"
 
-#include <algorithm>
+#include <sys/socket.h>
 
+#include <algorithm>
+#include <cstdint>
+
+#include "db/tcprw.h"
 #include "logging/logging.h"
 #include "port/malloc.h"
 #include "port/port.h"
 #include "rocksdb/env.h"
+#include "rocksdb/logger.hpp"
+#include "rocksdb/remote_flush_service.h"
 #include "test_util/sync_point.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+void Arena::PackLocal(TransferService* node) const {
+  int msg = 2;
+  node->send(&msg, sizeof(int));
+}
+
+void* Arena::UnPackLocal(TransferService*) {
+  void* arena = reinterpret_cast<void*>(new Arena());
+  return arena;
+}
 
 size_t Arena::OptimizeBlockSize(size_t block_size) {
   // Make sure block_size is in optimal range
@@ -33,8 +49,12 @@ size_t Arena::OptimizeBlockSize(size_t block_size) {
   return block_size;
 }
 
-Arena::Arena(size_t block_size, AllocTracker* tracker, size_t huge_page_size)
-    : kBlockSize(OptimizeBlockSize(block_size)), tracker_(tracker) {
+Arena::Arena(size_t block_size, AllocTracker* tracker, size_t huge_page_size,
+             RDMAClient* client, RDMANode::rdma_connection* conn)
+    : kBlockSize(OptimizeBlockSize(block_size)),
+      tracker_(tracker),
+      client_(client),
+      conn_(conn) {
   assert(kBlockSize >= kMinBlockSize && kBlockSize <= kMaxBlockSize &&
          kBlockSize % kAlignUnit == 0);
   TEST_SYNC_POINT_CALLBACK("Arena::Arena:0", const_cast<size_t*>(&kBlockSize));
@@ -51,12 +71,25 @@ Arena::Arena(size_t block_size, AllocTracker* tracker, size_t huge_page_size)
   if (tracker_ != nullptr) {
     tracker_->Allocate(kInlineSize);
   }
+  size_t size = kBlockSize;
+  char* block_head = AllocateNewBlock(size);
+  alloc_bytes_remaining_ = size;
+  aligned_alloc_ptr_ = block_head;
+  unaligned_alloc_ptr_ = block_head + size;
+  mem_begin_ = block_head;
 }
 
 Arena::~Arena() {
   if (tracker_ != nullptr) {
     assert(tracker_->is_freed());
     tracker_->FreeMem();
+  }
+  if (client_ != nullptr && conn_ != nullptr) {
+    auto offset = mem_begin_ - client_->get_buf();
+    client_->rdma_mem_.free(offset);
+    auto ret = blocks_[0].release();
+    assert(ret == mem_begin_ && blocks_.size() == 1);
+    blocks_.clear();
   }
 }
 
@@ -145,26 +178,59 @@ char* Arena::AllocateAligned(size_t bytes, size_t huge_page_size,
 char* Arena::AllocateNewBlock(size_t block_bytes) {
   // NOTE: std::make_unique zero-initializes the block so is not appropriate
   // here
-  char* block = new char[block_bytes];
+  char* block = nullptr;
+  if (client_ != nullptr && conn_ != nullptr && blocks_.empty()) {
+    auto offset = client_->rdma_mem_.allocate(block_bytes);
+    if (offset == -1)
+      LOG_CERR("Failed to allocate memory from RDMA client mempool");
+    auto remote_reg = client_->allocate_mem_request(conn_, block_bytes);
+    remote_reg_mem = {remote_reg.first, remote_reg.second - remote_reg.first};
+    block = client_->get_buf() + offset;
+    // block = new char[block_bytes];
+  } else {
+    block = new char[block_bytes];
+    if (conn_ != nullptr && client_ != nullptr) {
+      LOG_CERR("Arena Allocate New Builtin Block!!!:: ", conn_->sock,
+               "AllocateNewBlock: ", block_bytes,
+               " CHECK::", alloc_bytes_remaining_, ' ', kBlockSize, ' ',
+               blocks_.size());
+    }
+  }
   blocks_.push_back(std::unique_ptr<char[]>(block));
 
-  size_t allocated_size;
-#ifdef ROCKSDB_MALLOC_USABLE_SIZE
-  allocated_size = malloc_usable_size(block);
-#ifndef NDEBUG
-  // It's hard to predict what malloc_usable_size() returns.
-  // A callback can allow users to change the costed size.
-  std::pair<size_t*, size_t*> pair(&allocated_size, &block_bytes);
-  TEST_SYNC_POINT_CALLBACK("Arena::AllocateNewBlock:0", &pair);
-#endif  // NDEBUG
-#else
-  allocated_size = block_bytes;
-#endif  // ROCKSDB_MALLOC_USABLE_SIZE
+  size_t allocated_size = block_bytes;
+
   blocks_memory_ += allocated_size;
   if (tracker_ != nullptr) {
     tracker_->Allocate(allocated_size);
   }
   return block;
+}
+
+Status Arena::SendToRemote() const {
+  Status s;
+  if (client_ != nullptr && conn_ != nullptr) {
+    std::chrono::high_resolution_clock::time_point start_time =
+        std::chrono::high_resolution_clock::now();
+    client_->rdma_write(conn_, BlockSize(), mem_begin_ - client_->get_buf(),
+                        remote_reg_mem.first);
+    ASSERT_RW(client_->poll_completion(conn_) == 0);
+    std::chrono::high_resolution_clock::time_point end_time =
+        std::chrono::high_resolution_clock::now();
+    LOG_CERR("Arena SendToRemote: ",
+             std::chrono::duration_cast<std::chrono::microseconds>(end_time -
+                                                                   start_time)
+                 .count(),
+             " us, size = ", BlockSize());
+  }
+  return s;
+}
+
+void Arena::get_remote_page_info(uint64_t* info) const {
+  if (client_ != nullptr && conn_ != nullptr) {
+    info[0] = remote_reg_mem.first;
+    info[1] = remote_reg_mem.second;
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

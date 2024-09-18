@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <string>
 #include <vector>
 
@@ -403,4 +402,3 @@ class DBImplSecondary : public DBImpl {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

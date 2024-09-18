@@ -515,8 +515,7 @@ DEFINE_SYNC_AND_ASYNC(void, BlockBasedTable::MultiGet)
         // 2. If blocks are uncompressed, alloc heap bufs
         // 3. If blocks are compressed and no compressed block cache, use
         //    stack buf
-        if (!rep_->file->use_direct_io() &&
-            rep_->blocks_maybe_compressed) {
+        if (!rep_->file->use_direct_io() && rep_->blocks_maybe_compressed) {
           if (total_len <= kMultiGetReadStackBufSize) {
             scratch = stack_buf;
           } else {

@@ -830,4 +830,3 @@ bool CompactionServiceInput::TEST_Equals(CompactionServiceInput* other,
 }
 #endif  // NDEBUG
 }  // namespace ROCKSDB_NAMESPACE
-

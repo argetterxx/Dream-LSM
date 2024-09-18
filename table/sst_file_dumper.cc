@@ -514,4 +514,3 @@ Status SstFileDumper::ReadTableProperties(
   return init_result_;
 }
 }  // namespace ROCKSDB_NAMESPACE
-

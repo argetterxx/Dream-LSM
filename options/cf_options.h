@@ -5,12 +5,19 @@
 
 #pragma once
 
+#include <unistd.h>
+
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "db/dbformat.h"
+#include "db/slice_transform_factory.h"
 #include "options/db_options.h"
 #include "rocksdb/options.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
+#include "rocksdb/slice_transform.h"
 #include "util/compression.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -89,6 +96,37 @@ struct ImmutableCFOptions {
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {
+ public:
+  void PackLocal(TransferService* node) const {
+    this->ImmutableDBOptions::PackLocal(node);
+    size_t size = cf_paths[0].path.size();
+    node->send(&size, sizeof(size_t));
+    if (size > 0) node->send(cf_paths[0].path.data(), size);
+  }
+  static void* UnPackLocal(TransferService* node,
+                           const ColumnFamilyOptions& cf_options) {
+    void* immutabe_dboptions_ = ImmutableDBOptions::UnPackLocal(node);
+    auto* db_options_ =
+        reinterpret_cast<ImmutableDBOptions*>(immutabe_dboptions_);
+    auto* ret = new ImmutableOptions(*db_options_, cf_options);
+    ret->stats = nullptr;
+    delete db_options_;
+    size_t size = 0;
+    node->receive(&size, sizeof(size_t));
+    if (size > 0) {
+      std::string path;
+      path.resize(size);
+      node->receive(path.data(), size);
+      ret->cf_paths[0].path = path;
+    }
+    return reinterpret_cast<void*>(ret);
+  }
+  void PackRemote(TransferService* node) const {
+    const_cast<std::vector<DbPath>*>(&cf_paths)->clear();
+  }
+  void UnPackRemote(TransferService* node) const {}
+
+ public:
   explicit ImmutableOptions();
   explicit ImmutableOptions(const Options& options);
 
@@ -106,10 +144,33 @@ struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {
 };
 
 struct MutableCFOptions {
+ public:
+  void PackLocal(TransferService* node) const {
+    // node->send(reinterpret_cast<const void*>(this),
+    // sizeof(MutableCFOptions));
+    if (prefix_extractor != nullptr)
+      prefix_extractor->PackLocal(node);
+    else {
+      std::pair<uint8_t, size_t> msg(4, 0);
+      node->send(&msg, sizeof(msg));
+    }
+    node->send(&memtable_whole_key_filtering, sizeof(bool));
+  }
+  static void* UnPackLocal(TransferService* node) {
+    void* mem2 = new MutableCFOptions();
+    auto* ptr = reinterpret_cast<MutableCFOptions*>(mem2);
+    ptr->prefix_extractor.reset(reinterpret_cast<SliceTransform*>(
+        SliceTransformFactory::UnPackLocal(node)));
+    node->receive(&ptr->memtable_whole_key_filtering, sizeof(bool));
+    return mem2;
+  }
+
+ public:
   static const char* kName() { return "MutableCFOptions"; }
   explicit MutableCFOptions(const ColumnFamilyOptions& options)
       : write_buffer_size(options.write_buffer_size),
         max_write_buffer_number(options.max_write_buffer_number),
+        max_local_write_buffer_number(options.max_local_write_buffer_number),
         arena_block_size(options.arena_block_size),
         memtable_prefix_bloom_size_ratio(
             options.memtable_prefix_bloom_size_ratio),
@@ -244,6 +305,7 @@ struct MutableCFOptions {
   // Memtable related options
   size_t write_buffer_size;
   int max_write_buffer_number;
+  int max_local_write_buffer_number;
   size_t arena_block_size;
   double memtable_prefix_bloom_size_ratio;
   bool memtable_whole_key_filtering;
@@ -322,9 +384,10 @@ struct MutableCFOptions {
 uint64_t MultiplyCheckOverflow(uint64_t op1, double op2);
 
 // Get the max file size in a given level.
-uint64_t MaxFileSizeForLevel(const MutableCFOptions& cf_options,
-    int level, CompactionStyle compaction_style, int base_level = 1,
-    bool level_compaction_dynamic_level_bytes = false);
+uint64_t MaxFileSizeForLevel(const MutableCFOptions& cf_options, int level,
+                             CompactionStyle compaction_style,
+                             int base_level = 1,
+                             bool level_compaction_dynamic_level_bytes = false);
 
 // Get the max size of an L0 file for which we will pin its meta-blocks when
 // `pin_l0_filter_and_index_blocks_in_cache` is set.

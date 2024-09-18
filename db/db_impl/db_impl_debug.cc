@@ -306,7 +306,6 @@ SeqnoToTimeMapping DBImpl::TEST_GetSeqnoToTimeMapping() const {
   return seqno_time_mapping_;
 }
 
-
 size_t DBImpl::TEST_EstimateInMemoryStatsHistorySize() const {
   return EstimateInMemoryStatsHistorySize();
 }

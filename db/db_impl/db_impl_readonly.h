@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <string>
 #include <vector>
 
@@ -163,4 +162,3 @@ class DBImplReadOnly : public DBImpl {
   friend class DB;
 };
 }  // namespace ROCKSDB_NAMESPACE
-

@@ -108,4 +108,3 @@ void PeriodicTaskScheduler::TEST_OverrideTimer(SystemClock* clock) {
 #endif  // NDEBUG
 
 }  // namespace ROCKSDB_NAMESPACE
-

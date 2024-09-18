@@ -4,7 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 
-
 #include <algorithm>
 #include <atomic>
 
@@ -166,7 +165,8 @@ class HashLinkListRep : public MemTableRep {
                   int bucket_entries_logging_threshold,
                   bool if_log_bucket_dist_when_flash);
 
-  KeyHandle Allocate(const size_t len, char** buf) override;
+  KeyHandle Allocate(const size_t len, char** buf, char** kv_buf = nullptr,
+                     const char* prefix = nullptr) override;
 
   void Insert(KeyHandle handle) override;
 
@@ -528,7 +528,8 @@ HashLinkListRep::HashLinkListRep(
 
 HashLinkListRep::~HashLinkListRep() {}
 
-KeyHandle HashLinkListRep::Allocate(const size_t len, char** buf) {
+KeyHandle HashLinkListRep::Allocate(const size_t len, char** buf, char** kv_buf,
+                                    const char* prefix) {
   char* mem = allocator_->AllocateAligned(sizeof(Node) + len);
   Node* x = new (mem) Node();
   *buf = x->key;

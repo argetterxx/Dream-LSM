@@ -2657,8 +2657,7 @@ void StressTest::Open(SharedState* shared) {
           if (s.ok()) {
             db_ = blob_db;
           }
-        } else
-        {
+        } else {
           if (db_preload_finished_.load() && FLAGS_read_only) {
             s = DB::OpenForReadOnly(DBOptions(options_), FLAGS_db,
                                     cf_descriptors, &column_families_, &db_);

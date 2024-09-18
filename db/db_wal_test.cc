@@ -1671,7 +1671,6 @@ TEST_F(DBWALTest, FixSyncWalOnObseletedWalWithNewManifestCausingMissingWAL) {
         wal_synced = true;
       });
 
-
   SyncPoint::GetInstance()->EnableProcessing();
 
   ASSERT_OK(Flush());
@@ -2339,7 +2338,6 @@ TEST_F(DBWALTest, WalInManifestButNotInSortedWals) {
   wals_go_missing = false;
   Close();
 }
-
 
 TEST_F(DBWALTest, WalTermTest) {
   Options options = CurrentOptions();

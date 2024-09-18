@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include <cassert>
 #include <map>
 #include <memory>
 #include <string>
@@ -176,7 +177,8 @@ class DB {
                      const std::vector<ColumnFamilyDescriptor>& column_families,
                      std::vector<ColumnFamilyHandle*>* handles, DB** dbptr);
 
-  // OpenForReadOnly() creates a Read-only instance that supports reads alone.
+  // OpenForReadOnly() creates a Read-only instance that supports reads
+  // alone.
   //
   // All DB interfaces that modify data, like put/delete, will return error.
   // Automatic Flush and Compactions are disabled and any manual calls
@@ -388,6 +390,14 @@ class DB {
   // column family handles (except for DefaultColumnFamily()!) before closing
   // a DB.
   virtual Status DestroyColumnFamilyHandle(ColumnFamilyHandle* column_family);
+
+  virtual Status ListenAndScheduleFlushJob(int) {
+    LOG("ListenAndScheduleFlushJob not supported");
+    return Status::NotSupported();
+  }
+  virtual void TEST_RemoteFlushListener() {
+    LOG("RemoteFlushListener not supported");
+  }
 
   // Set the database entry for "key" to "value".
   // If "key" already exists, it will be overwritten.
@@ -1775,7 +1785,6 @@ class DB {
 
   virtual Status VerifyChecksum() { return VerifyChecksum(ReadOptions()); }
 
-
   // Returns the unique ID which is read from IDENTITY file during the opening
   // of database by setting in the identity variable
   // Returns Status::OK if identity could be set properly
@@ -1790,7 +1799,6 @@ class DB {
 
   // Returns default column family handle
   virtual ColumnFamilyHandle* DefaultColumnFamily() const = 0;
-
 
   virtual Status GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
                                           TablePropertiesCollection* props) = 0;
@@ -1857,7 +1865,6 @@ class DB {
     return Status::NotSupported("NewDefaultReplayer() is not implemented.");
   }
 
-
   // Needed for StackableDB
   virtual DB* GetRootDB() { return this; }
 
@@ -1883,6 +1890,14 @@ class DB {
   virtual Status TryCatchUpWithPrimary() {
     return Status::NotSupported("Supported only by secondary instance");
   }
+
+  virtual void register_memnode(const std::string&, size_t, int = 1) {
+    assert(false);
+  }
+  virtual void unregister_memnode(const std::string&, size_t) { assert(false); }
+  virtual void register_local_ip(const std::string&) { assert(false); }
+  virtual void register_pd_client(const PDClient*) { assert(false); }
+  virtual void unregister_pd_client() { assert(false); }
 };
 
 struct WriteStallStatsMapKeys {
@@ -1956,6 +1971,5 @@ Status RepairDB(const std::string& dbname, const DBOptions& db_options,
 // @param options These options will be used for the database and for ALL column
 //                families encountered during the repair
 Status RepairDB(const std::string& dbname, const Options& options);
-
 
 }  // namespace ROCKSDB_NAMESPACE

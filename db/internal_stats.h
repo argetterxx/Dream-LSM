@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <cassert>
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <string>
@@ -19,7 +21,6 @@
 #include "db/version_set.h"
 #include "rocksdb/system_clock.h"
 #include "util/hash_containers.h"
-
 namespace ROCKSDB_NAMESPACE {
 
 template <class Stats>
@@ -100,6 +101,134 @@ struct DBStatInfo {
 };
 
 class InternalStats {
+ public:
+  void DoubleCheck(TransferService* node) const {
+    std::string parse;
+    for (int i = 0; i < kIntStatsNumMax; i++) {
+      parse.append(std::to_string(db_stats_[i].load()) + " ");
+    }
+    parse.append("\n");
+    for (int i = 0; i < INTERNAL_CF_STATS_ENUM_MAX; i++) {
+      parse.append(std::to_string(cf_stats_value_[i]) + " ");
+    }
+    parse.append("\nComp_Stats::\n");
+    for (size_t i = 0; i < comp_stats_.size(); ++i) {
+      parse.append(std::to_string(comp_stats_[i].micros) + " ");
+      parse.append(std::to_string(comp_stats_[i].cpu_micros) + " ");
+      parse.append(std::to_string(comp_stats_[i].bytes_read_non_output_levels) +
+                   " ");
+      parse.append(std::to_string(comp_stats_[i].bytes_read_output_level) +
+                   " ");
+      parse.append(std::to_string(comp_stats_[i].bytes_read_blob) + " ");
+      parse.append(std::to_string(comp_stats_[i].bytes_written) + " ");
+      parse.append(std::to_string(comp_stats_[i].bytes_written_blob) + " ");
+      parse.append(std::to_string(comp_stats_[i].bytes_moved) + " ");
+      parse.append(
+          std::to_string(comp_stats_[i].num_input_files_in_non_output_levels) +
+          " ");
+      parse.append(
+          std::to_string(comp_stats_[i].num_input_files_in_output_level) + " ");
+      parse.append(std::to_string(comp_stats_[i].num_output_files) + " ");
+      parse.append(std::to_string(comp_stats_[i].num_output_files_blob) + " ");
+      parse.append(std::to_string(comp_stats_[i].num_input_records) + " ");
+      parse.append(std::to_string(comp_stats_[i].num_dropped_records) + " ");
+      parse.append(std::to_string(comp_stats_[i].num_output_records) + " ");
+      parse.append(std::to_string(comp_stats_[i].count) + " ");
+      for (int j = 0; j < static_cast<int>(CompactionReason::kNumOfReasons);
+           j++) {
+        parse.append(std::to_string(comp_stats_[i].counts[j]) + " ");
+      }
+    }
+
+    parse.append("\nCompStatsByPri::\n");
+    for (size_t i = 0; i < comp_stats_by_pri_.size(); ++i) {
+      parse.append(std::to_string(comp_stats_by_pri_[i].micros) + " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].cpu_micros) + " ");
+      parse.append(
+          std::to_string(comp_stats_by_pri_[i].bytes_read_non_output_levels) +
+          " ");
+      parse.append(
+          std::to_string(comp_stats_by_pri_[i].bytes_read_output_level) + " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].bytes_read_blob) + " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].bytes_written) + " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].bytes_written_blob) +
+                   " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].bytes_moved) + " ");
+      parse.append(
+          std::to_string(
+              comp_stats_by_pri_[i].num_input_files_in_non_output_levels) +
+          " ");
+      parse.append(std::to_string(
+                       comp_stats_by_pri_[i].num_input_files_in_output_level) +
+                   " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].num_output_files) +
+                   " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].num_output_files_blob) +
+                   " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].num_input_records) +
+                   " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].num_dropped_records) +
+                   " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].num_output_records) +
+                   " ");
+      parse.append(std::to_string(comp_stats_by_pri_[i].count) + " ");
+      for (int j = 0; j < static_cast<int>(CompactionReason::kNumOfReasons);
+           j++) {
+        parse.append(std::to_string(comp_stats_by_pri_[i].counts[j]) + " ");
+      }
+    }
+    parse.append("\n");
+    parse.append(std::to_string(per_key_placement_comp_stats_.count) + " ");
+    parse.append("\n");
+    LOG_CERR("DoubleCheck:Internal:: ", parse);
+  }
+  void PackRemote(TransferService* node) const {
+    node->send(db_stats_, sizeof(uint64_t) * kIntStatsNumMax);
+    node->send(cf_stats_value_, sizeof(uint64_t) * INTERNAL_CF_STATS_ENUM_MAX);
+    size_t comp_stats_size = comp_stats_.size();
+    node->send(&comp_stats_size, sizeof(size_t));
+    node->send(comp_stats_.data(), sizeof(CompactionStats) * comp_stats_size);
+
+    size_t comp_stats_by_pri_size = comp_stats_by_pri_.size();
+    node->send(&comp_stats_by_pri_size, sizeof(size_t));
+    node->send(comp_stats_by_pri_.data(),
+               sizeof(CompactionStats) * comp_stats_by_pri_size);
+    node->send(&per_key_placement_comp_stats_, sizeof(CompactionStats));
+  }
+
+  void UnPackRemote(TransferService* node) {
+    std::atomic<uint64_t> db_stats[kIntStatsNumMax];
+    node->receive(db_stats, sizeof(uint64_t) * kIntStatsNumMax);
+    for (int i = 0; i < kIntStatsNumMax; i++) {
+      AddDBStats(static_cast<InternalDBStatsType>(i), db_stats[i].load());
+    }
+    uint64_t cf_stats_value[INTERNAL_CF_STATS_ENUM_MAX];
+    node->receive(cf_stats_value,
+                  sizeof(uint64_t) * INTERNAL_CF_STATS_ENUM_MAX);
+    for (int i = 0; i < INTERNAL_CF_STATS_ENUM_MAX; i++) {
+      AddCFStats(static_cast<InternalCFStatsType>(i), cf_stats_value[i]);
+    }
+    size_t comp_stats_size = 0;
+    node->receive(&comp_stats_size, sizeof(size_t));
+    assert(comp_stats_size == comp_stats_.size());
+    std::vector<CompactionStats> comp_stats;
+    comp_stats.resize(comp_stats_size);
+    node->receive(comp_stats.data(), sizeof(CompactionStats) * comp_stats_size);
+    for (size_t i = 0; i < comp_stats_size; ++i) {
+      comp_stats_[i].Add(comp_stats[i]);
+    }
+    size_t comp_stats_by_pri_size = 0;
+    node->receive(&comp_stats_by_pri_size, sizeof(size_t));
+    assert(comp_stats_by_pri_size == comp_stats_by_pri_.size());
+    std::vector<CompactionStats> comp_stats_by_pri;
+    comp_stats_by_pri.resize(comp_stats_by_pri_size);
+    node->receive(comp_stats_by_pri.data(),
+                  sizeof(CompactionStats) * comp_stats_by_pri_size);
+    for (size_t i = 0; i < comp_stats_by_pri_size; ++i) {
+      comp_stats_by_pri_[i].Add(comp_stats_by_pri[i]);
+    }
+  }
+
  public:
   static const std::map<LevelStatType, LevelStat> compaction_level_stats;
 
@@ -869,6 +998,5 @@ class InternalStats {
   ColumnFamilyData* cfd_;
   uint64_t started_at_;
 };
-
 
 }  // namespace ROCKSDB_NAMESPACE

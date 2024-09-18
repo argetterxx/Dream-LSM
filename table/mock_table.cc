@@ -15,7 +15,6 @@
 
 namespace ROCKSDB_NAMESPACE {
 namespace mock {
-
 KVVector MakeMockFile(std::initializer_list<KVPair> l) { return KVVector(l); }
 
 void SortKVVector(KVVector* kv_vector, const Comparator* ucmp) {
@@ -339,6 +338,5 @@ void MockTableFactory::AssertLatestFiles(
     }
   }
 }
-
 }  // namespace mock
 }  // namespace ROCKSDB_NAMESPACE

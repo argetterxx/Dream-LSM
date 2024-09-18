@@ -262,6 +262,8 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   int max_write_buffer_number = 2;
 
+  int max_local_write_buffer_number = 0;
+
   // The minimum number of write buffers that will be merged together
   // before writing to storage.  If set to 1, then
   // all write buffers are flushed to L0 as individual files and this increases
@@ -1108,7 +1110,7 @@ struct AdvancedColumnFamilyOptions {
   // Default: 0 (no protection)
   // Supported values: 0, 1, 2, 4, 8.
   uint32_t memtable_protection_bytes_per_key = 0;
-
+  bool server_use_remote_flush = false;
   // Create ColumnFamilyOptions with default values for all fields
   AdvancedColumnFamilyOptions();
   // Create ColumnFamilyOptions from Options

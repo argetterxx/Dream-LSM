@@ -29,9 +29,7 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
-ConfigOptions::ConfigOptions()
-    : registry(ObjectRegistry::NewInstance())
-{
+ConfigOptions::ConfigOptions() : registry(ObjectRegistry::NewInstance()) {
   env = Env::Default();
 }
 
@@ -48,7 +46,121 @@ Status ValidateOptions(const DBOptions& db_opts,
   if (s.ok()) s = cf_cfg->ValidateOptions(db_opts, cf_opts);
   return s;
 }
+ImmutableDBOptions BuildImmutableDBOptions(const DBOptions& db_opts) {
+  ImmutableDBOptions ioptions;
+  ioptions.create_if_missing = db_opts.create_if_missing;
+  ioptions.create_missing_column_families =
+      db_opts.create_missing_column_families;
+  ioptions.error_if_exists = db_opts.error_if_exists;
+  ioptions.paranoid_checks = db_opts.paranoid_checks;
+  ioptions.flush_verify_memtable_count = db_opts.flush_verify_memtable_count;
+  ioptions.track_and_verify_wals_in_manifest =
+      db_opts.track_and_verify_wals_in_manifest;
+  ioptions.verify_sst_unique_id_in_manifest =
+      db_opts.verify_sst_unique_id_in_manifest;
+  ioptions.env = db_opts.env;
+  ioptions.rate_limiter = db_opts.rate_limiter;
+  ioptions.sst_file_manager = db_opts.sst_file_manager;
+  ioptions.info_log = db_opts.info_log;
+  ioptions.info_log_level = db_opts.info_log_level;
+  ioptions.max_file_opening_threads = db_opts.max_file_opening_threads;
+  ioptions.statistics = db_opts.statistics;
+  ioptions.use_fsync = db_opts.use_fsync;
+  ioptions.db_paths = db_opts.db_paths;
+  ioptions.db_log_dir = db_opts.db_log_dir;
+  ioptions.wal_dir = db_opts.wal_dir;
+  ioptions.max_log_file_size = db_opts.max_log_file_size;
+  ioptions.log_file_time_to_roll = db_opts.log_file_time_to_roll;
+  ioptions.keep_log_file_num = db_opts.keep_log_file_num;
+  ioptions.recycle_log_file_num = db_opts.recycle_log_file_num;
+  ioptions.max_manifest_file_size = db_opts.max_manifest_file_size;
+  ioptions.table_cache_numshardbits = db_opts.table_cache_numshardbits;
+  ioptions.WAL_ttl_seconds = db_opts.WAL_ttl_seconds;
+  ioptions.WAL_size_limit_MB = db_opts.WAL_size_limit_MB;
+  ioptions.manifest_preallocation_size = db_opts.manifest_preallocation_size;
+  ioptions.allow_mmap_reads = db_opts.allow_mmap_reads;
+  ioptions.allow_mmap_writes = db_opts.allow_mmap_writes;
+  ioptions.use_direct_reads = db_opts.use_direct_reads;
+  ioptions.use_direct_io_for_flush_and_compaction =
+      db_opts.use_direct_io_for_flush_and_compaction;
+  ioptions.allow_fallocate = db_opts.allow_fallocate;
+  ioptions.is_fd_close_on_exec = db_opts.is_fd_close_on_exec;
+  ioptions.persist_stats_to_disk = db_opts.persist_stats_to_disk;
+  ioptions.advise_random_on_open = db_opts.advise_random_on_open;
+  ioptions.db_write_buffer_size = db_opts.db_write_buffer_size;
+  ioptions.write_buffer_manager = db_opts.write_buffer_manager;
+  ioptions.access_hint_on_compaction_start =
+      db_opts.access_hint_on_compaction_start;
+  ioptions.random_access_max_buffer_size =
+      db_opts.random_access_max_buffer_size;
+  ioptions.use_adaptive_mutex = db_opts.use_adaptive_mutex;
 
+  ioptions.listeners = db_opts.listeners;
+  ioptions.enable_thread_tracking = db_opts.enable_thread_tracking;
+  ioptions.enable_pipelined_write = db_opts.enable_pipelined_write;
+  ioptions.unordered_write = db_opts.unordered_write;
+  ioptions.allow_concurrent_memtable_write =
+      db_opts.allow_concurrent_memtable_write;
+  ioptions.enable_write_thread_adaptive_yield =
+      db_opts.enable_write_thread_adaptive_yield;
+  ioptions.max_write_batch_group_size_bytes =
+      db_opts.max_write_batch_group_size_bytes;
+  ioptions.write_thread_max_yield_usec = db_opts.write_thread_max_yield_usec;
+  ioptions.write_thread_slow_yield_usec = db_opts.write_thread_slow_yield_usec;
+  ioptions.skip_stats_update_on_db_open = db_opts.skip_stats_update_on_db_open;
+  ioptions.skip_checking_sst_file_sizes_on_db_open =
+      db_opts.skip_checking_sst_file_sizes_on_db_open;
+  ioptions.wal_recovery_mode = db_opts.wal_recovery_mode;
+  ioptions.allow_2pc = db_opts.allow_2pc;
+  ioptions.row_cache = db_opts.row_cache;
+  ioptions.wal_filter = db_opts.wal_filter;
+  ioptions.fail_if_options_file_error = db_opts.fail_if_options_file_error;
+  ioptions.dump_malloc_stats = db_opts.dump_malloc_stats;
+  ioptions.avoid_flush_during_recovery = db_opts.avoid_flush_during_recovery;
+  ioptions.allow_ingest_behind = db_opts.allow_ingest_behind;
+  ioptions.two_write_queues = db_opts.two_write_queues;
+  ioptions.manual_wal_flush = db_opts.manual_wal_flush;
+  ioptions.wal_compression = db_opts.wal_compression;
+  ioptions.atomic_flush = db_opts.atomic_flush;
+  ioptions.avoid_unnecessary_blocking_io =
+      db_opts.avoid_unnecessary_blocking_io;
+  ioptions.log_readahead_size = db_opts.log_readahead_size;
+  ioptions.file_checksum_gen_factory = db_opts.file_checksum_gen_factory;
+  ioptions.best_efforts_recovery = db_opts.best_efforts_recovery;
+  ioptions.max_bgerror_resume_count = db_opts.max_bgerror_resume_count;
+  ioptions.bgerror_resume_retry_interval =
+      db_opts.bgerror_resume_retry_interval;
+  ioptions.db_host_id = db_opts.db_host_id;
+  ioptions.allow_data_in_errors = db_opts.allow_data_in_errors;
+  ioptions.checksum_handoff_file_types = db_opts.checksum_handoff_file_types;
+  ioptions.lowest_used_cache_tier = db_opts.lowest_used_cache_tier;
+  ioptions.enforce_single_del_contracts = db_opts.enforce_single_del_contracts;
+  return ioptions;
+}
+
+MutableDBOptions BuildMutableDBOptions(const DBOptions& db_opts) {
+  MutableDBOptions ioptions;
+  ioptions.max_open_files = db_opts.max_open_files;
+  ioptions.max_total_wal_size = db_opts.max_total_wal_size;
+  ioptions.delete_obsolete_files_period_micros =
+      db_opts.delete_obsolete_files_period_micros;
+  ioptions.max_background_jobs = db_opts.max_background_jobs;
+  ioptions.max_background_compactions = db_opts.max_background_compactions;
+  ioptions.bytes_per_sync = db_opts.bytes_per_sync;
+  ioptions.wal_bytes_per_sync = db_opts.wal_bytes_per_sync;
+  ioptions.strict_bytes_per_sync = db_opts.strict_bytes_per_sync;
+  ioptions.max_subcompactions = db_opts.max_subcompactions;
+  ioptions.max_background_flushes = db_opts.max_background_flushes;
+  ioptions.stats_dump_period_sec = db_opts.stats_dump_period_sec;
+  ioptions.stats_persist_period_sec = db_opts.stats_persist_period_sec;
+  ioptions.stats_history_buffer_size = db_opts.stats_history_buffer_size;
+  ioptions.compaction_readahead_size = db_opts.compaction_readahead_size;
+  ioptions.writable_file_max_buffer_size =
+      db_opts.writable_file_max_buffer_size;
+  ioptions.delayed_write_rate = db_opts.delayed_write_rate;
+  ioptions.avoid_flush_during_shutdown = db_opts.avoid_flush_during_shutdown;
+  return ioptions;
+}
 DBOptions BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
                          const MutableDBOptions& mutable_db_options) {
   DBOptions options;
@@ -478,13 +590,11 @@ bool SerializeSingleOptionHelper(const void* opt_address,
     case OptionType::kInt32T:
       *value = std::to_string(*(static_cast<const int32_t*>(opt_address)));
       break;
-    case OptionType::kInt64T:
-      {
-        int64_t v;
-        GetUnaligned(static_cast<const int64_t*>(opt_address), &v);
-        *value = std::to_string(v);
-      }
-      break;
+    case OptionType::kInt64T: {
+      int64_t v;
+      GetUnaligned(static_cast<const int64_t*>(opt_address), &v);
+      *value = std::to_string(v);
+    } break;
     case OptionType::kUInt:
       *value = std::to_string(*(static_cast<const unsigned int*>(opt_address)));
       break;
@@ -494,20 +604,16 @@ bool SerializeSingleOptionHelper(const void* opt_address,
     case OptionType::kUInt32T:
       *value = std::to_string(*(static_cast<const uint32_t*>(opt_address)));
       break;
-    case OptionType::kUInt64T:
-      {
-        uint64_t v;
-        GetUnaligned(static_cast<const uint64_t*>(opt_address), &v);
-        *value = std::to_string(v);
-      }
-      break;
-    case OptionType::kSizeT:
-      {
-        size_t v;
-        GetUnaligned(static_cast<const size_t*>(opt_address), &v);
-        *value = std::to_string(v);
-      }
-      break;
+    case OptionType::kUInt64T: {
+      uint64_t v;
+      GetUnaligned(static_cast<const uint64_t*>(opt_address), &v);
+      *value = std::to_string(v);
+    } break;
+    case OptionType::kSizeT: {
+      size_t v;
+      GetUnaligned(static_cast<const size_t*>(opt_address), &v);
+      *value = std::to_string(v);
+    } break;
     case OptionType::kDouble:
       *value = std::to_string(*(static_cast<const double*>(opt_address)));
       break;
@@ -568,7 +674,6 @@ Status ConfigureFromMap(
   return s;
 }
 
-
 Status StringToMap(const std::string& opts_str,
                    std::unordered_map<std::string, std::string>* opts_map) {
   assert(opts_map);
@@ -612,7 +717,6 @@ Status StringToMap(const std::string& opts_str,
   return Status::OK();
 }
 
-
 Status GetStringFromDBOptions(std::string* opt_string,
                               const DBOptions& db_options,
                               const std::string& delimiter) {
@@ -629,7 +733,6 @@ Status GetStringFromDBOptions(const ConfigOptions& config_options,
   auto config = DBOptionsAsConfigurable(db_options);
   return config->GetOptionString(config_options, opt_string);
 }
-
 
 Status GetStringFromColumnFamilyOptions(std::string* opt_string,
                                         const ColumnFamilyOptions& cf_options,

@@ -6,7 +6,12 @@
 #include "db/memtable_list.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <chrono>
 #include <cinttypes>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <queue>
 #include <string>
@@ -21,8 +26,10 @@
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
+#include "rocksdb/status.h"
 #include "table/merging_iterator.h"
 #include "test_util/sync_point.h"
+#include "trace_replay/trace_replay.h"
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -49,6 +56,8 @@ MemTableListVersion::MemTableListVersion(
     size_t* parent_memtable_list_memory_usage, const MemTableListVersion& old)
     : max_write_buffer_number_to_maintain_(
           old.max_write_buffer_number_to_maintain_),
+      max_local_write_buffer_number_to_maintain_(
+          old.max_local_write_buffer_number_to_maintain_),
       max_write_buffer_size_to_maintain_(
           old.max_write_buffer_size_to_maintain_),
       parent_memtable_list_memory_usage_(parent_memtable_list_memory_usage) {
@@ -66,8 +75,11 @@ MemTableListVersion::MemTableListVersion(
 MemTableListVersion::MemTableListVersion(
     size_t* parent_memtable_list_memory_usage,
     int max_write_buffer_number_to_maintain,
+    int max_local_write_buffer_number_to_maintain,
     int64_t max_write_buffer_size_to_maintain)
     : max_write_buffer_number_to_maintain_(max_write_buffer_number_to_maintain),
+      max_local_write_buffer_number_to_maintain_(
+          max_local_write_buffer_number_to_maintain),
       max_write_buffer_size_to_maintain_(max_write_buffer_size_to_maintain),
       parent_memtable_list_memory_usage_(parent_memtable_list_memory_usage) {}
 
@@ -104,16 +116,15 @@ int MemTableList::NumFlushed() const {
 // Search all the memtables starting from the most recent one.
 // Return the most recent value found, if any.
 // Operands stores the list of merge operations to apply, so far.
-bool MemTableListVersion::Get(const LookupKey& key, std::string* value,
-                              PinnableWideColumns* columns,
-                              std::string* timestamp, Status* s,
-                              MergeContext* merge_context,
-                              SequenceNumber* max_covering_tombstone_seq,
-                              SequenceNumber* seq, const ReadOptions& read_opts,
-                              ReadCallback* callback, bool* is_blob_index) {
+bool MemTableListVersion::Get(
+    const LookupKey& key, std::string* value, PinnableWideColumns* columns,
+    std::string* timestamp, Status* s, MergeContext* merge_context,
+    SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
+    const ReadOptions& read_opts, ReadCallback* callback, bool* is_blob_index,
+    RDMAReadClient* read_client, uint64_t cfd_id, ColumnFamilyData* cfd_) {
   return GetFromList(&memlist_, key, value, columns, timestamp, s,
                      merge_context, max_covering_tombstone_seq, seq, read_opts,
-                     callback, is_blob_index);
+                     callback, is_blob_index, read_client, cfd_id, cfd_);
 }
 
 void MemTableListVersion::MultiGet(const ReadOptions& read_options,
@@ -158,36 +169,181 @@ bool MemTableListVersion::GetFromList(
     PinnableWideColumns* columns, std::string* timestamp, Status* s,
     MergeContext* merge_context, SequenceNumber* max_covering_tombstone_seq,
     SequenceNumber* seq, const ReadOptions& read_opts, ReadCallback* callback,
-    bool* is_blob_index) {
+    bool* is_blob_index, RDMAReadClient* read_client, uint64_t cfd_id,
+    ColumnFamilyData* cfd_) {
+  bool need_remote_read = false;
+  std::vector<uint64_t> mixed_ids;
   *seq = kMaxSequenceNumber;
-
+  // if (list->size() > 0) {
+  //   std::string now1;
+  //   for (auto& id_ : *list) {
+  //     now1 += std::to_string(id_->GetID()) + "::";
+  //     if (id_->IsTransferCompleted()) {
+  //       now1 += "2,";
+  //     } else if (id_->IsTransferCalled()) {
+  //       now1 += "1,";
+  //     } else {
+  //       now1 += "0,";
+  //     }
+  //   }
+  //   LOG_CERR("memtable list::", now1);
+  // }
+  // std::chrono::high_resolution_clock::time_point now_start =
+  //     std::chrono::high_resolution_clock::now();
+  // int bloom_cnt = 0;
+  // std::chrono::high_resolution_clock::duration bloom_dura =
+  //     std::chrono::high_resolution_clock::duration::zero();
+  int cnt = 0;
+  uint64_t acc_id = cfd_->get_trans_mem_accumulated_id();
   for (auto& memtable : *list) {
+    cnt++;
     assert(memtable->IsFragmentedRangeTombstonesConstructed());
     SequenceNumber current_seq = kMaxSequenceNumber;
-
-    bool done =
-        memtable->Get(key, value, columns, timestamp, s, merge_context,
-                      max_covering_tombstone_seq, &current_seq, read_opts,
-                      true /* immutable_memtable */, callback, is_blob_index);
-    if (*seq == kMaxSequenceNumber) {
-      // Store the most recent sequence number of any operation on this key.
-      // Since we only care about the most recent change, we only need to
-      // return the first operation found when searching memtables in
-      // reverse-chronological order.
-      // current_seq would be equal to kMaxSequenceNumber if the value was to be
-      // skipped. This allows seq to be assigned again when the next value is
-      // read.
-      *seq = current_seq;
-    }
-
-    if (done) {
-      assert(*seq != kMaxSequenceNumber || s->IsNotFound());
-      return true;
-    }
-    if (!done && !s->ok() && !s->IsMergeInProgress() && !s->IsNotFound()) {
-      return false;
+    bool done = false;
+    if (!need_remote_read &&
+        (cnt <= max_local_write_buffer_number_to_maintain_ ||
+         memtable->GetID() > acc_id)) {
+      done =
+          memtable->Get(key, value, columns, timestamp, s, merge_context,
+                        max_covering_tombstone_seq, &current_seq, read_opts,
+                        true /* immutable_memtable */, callback, is_blob_index);
+      if (*seq == kMaxSequenceNumber) {
+        *seq = current_seq;
+      }
+      if (done) {
+        assert(*seq != kMaxSequenceNumber || s->IsNotFound());
+        // std::chrono::time_point<std::chrono::system_clock> now_end =
+        //     std::chrono::system_clock::now();
+        // LOG_CERR("local_read_all_time::found::",
+        //          std::chrono::duration_cast<std::chrono::microseconds>(
+        //              now_end - now_start)
+        //              .count(),
+        //          ' ', "memtable_num::", cnt);
+        return true;
+      }
+      if (!done && !s->ok() && !s->IsMergeInProgress() && !s->IsNotFound()) {
+        // std::chrono::time_point<std::chrono::system_clock> now_end =
+        //     std::chrono::system_clock::now();
+        // LOG_CERR("local_read_all_time::notfound::",
+        //          std::chrono::duration_cast<std::chrono::microseconds>(
+        //              now_end - now_start)
+        //              .count(),
+        //          ' ', "memtable_num::", cnt);
+        return false;
+      }
+    } else {
+      need_remote_read = true;
+      assert(memtable->IsTransferCompleted());
+      // std::chrono::high_resolution_clock::time_point bloom1 =
+      //     std::chrono::high_resolution_clock::now();
+      // bloom_cnt++;
+      bool prev = memtable->PrevGet(
+          key, value, columns, timestamp, s, merge_context,
+          max_covering_tombstone_seq, &current_seq, read_opts, true, callback,
+          is_blob_index, true, read_client, nullptr, cfd_id);
+      if (prev) mixed_ids.emplace_back(memtable->GetID());
+      // std::chrono::high_resolution_clock::time_point bloom2 =
+      //     std::chrono::high_resolution_clock::now();
+      // bloom_dura += bloom2 - bloom1;
+      // done = memtable->Get(key, value, columns, timestamp, s, merge_context,
+      //                      max_covering_tombstone_seq, &current_seq,
+      //                      read_opts, true, callback, is_blob_index, true,
+      //                      read_client, conn, cfd_id);
+      // if (*seq == kMaxSequenceNumber) *seq = current_seq;
+      // if (done) {
+      //   assert(*seq != kMaxSequenceNumber || s->IsNotFound());
+      //   return true;
+      // }
+      // if (!done && !s->ok() && !s->IsMergeInProgress() && !s->IsNotFound()) {
+      //   return false;
+      // }
     }
   }
+
+  if (need_remote_read && mixed_ids.size() > 0) {
+    // std::string now;
+    // for (auto id_ : mixed_ids) {
+    //   now += std::to_string(id_) + ",";
+    // }
+    // LOG_CERR("remote read mixed_ids::", now);
+    // std::chrono::high_resolution_clock::time_point read1 =
+    //     std::chrono::high_resolution_clock::now();
+    size_t rr_offset = 0;
+    read_client->available_read_reqs_.wait_dequeue(rr_offset);
+    auto* req_packet =
+        reinterpret_cast<imm_read_req_v2*>(read_client->get_buf() + rr_offset);
+    // pack into req_v2
+    assert(s != nullptr);
+    req_packet->status_code = s->code();
+    assert(key.memtable_key().size() < 25);
+    std::memcpy(req_packet->key, key.memtable_key().data(),
+                key.memtable_key().size());
+    req_packet->memtable_key_len = key.memtable_key().size();
+    req_packet->found_final_value = false;
+    req_packet->max_covering_tombstone_seq = *max_covering_tombstone_seq;
+    assert(memlist_.size());
+    req_packet->allow_data_in_errors = memlist_.back()
+                                           ->GetImmutableMemTableOptions()
+                                           ->allow_data_in_errors;  //
+    req_packet->protection_bytes_per_key = memlist_.back()
+                                               ->GetImmutableMemTableOptions()
+                                               ->protection_bytes_per_key;  //
+    if (timestamp == nullptr) {
+      req_packet->timestamp_size_ = -1;
+    } else if (timestamp->empty()) {
+      req_packet->timestamp_size_ = 0;
+    } else {
+      req_packet->timestamp_size_ = timestamp->size();
+      assert(req_packet->timestamp_size_ < 25);
+      memcpy(req_packet->timestamp, timestamp->data(), timestamp->size());
+    }
+    req_packet->seq = *seq;
+    req_packet->mixed_ids_size = mixed_ids.size();
+    assert(mixed_ids.size() < 25);
+    for (int i = 0; i < mixed_ids.size(); i++) {
+      req_packet->mixed_ids[i] = mixed_ids[i];
+    }
+
+    auto conn = cfd_->get_cflevel_read_connection();
+    bool ret = read_client->client_send_request_for_memtable_read_v2(
+        conn, req_packet, value, timestamp);
+    if (req_packet->status_code == Status::Code::kOk) {
+      *s = Status::OK();
+    } else if (req_packet->status_code == Status::Code::kCorruption) {
+      *s = Status::Corruption();
+    } else if (req_packet->status_code == Status::Code::kNotSupported) {
+      *s = Status::NotSupported();
+    } else if (req_packet->status_code == Status::Code::kNotFound) {
+      *s = Status::NotFound();
+    } else if (req_packet->status_code == -1) {
+    } else {
+      assert(false);
+    }
+    *seq = req_packet->seq;
+    // delete req_packet;
+    read_client->available_read_reqs_.enqueue(rr_offset);
+    cfd_->put_cflevel_read_connection(conn);
+    // std::chrono::high_resolution_clock::time_point read2 =
+    //     std::chrono::high_resolution_clock::now();
+    // LOG_CERR(
+    //     ":::: ",
+    //     std::chrono::duration_cast<std::chrono::microseconds>(read2 - read1)
+    //         .count(),
+    //     ' ',
+    //     std::chrono::duration_cast<std::chrono::microseconds>(bloom_dura)
+    //         .count(),
+    //     ' ', mixed_ids.size());
+    return ret;
+  }
+  // if (cnt) {
+  //   std::chrono::time_point<std::chrono::system_clock> now_end =
+  //       std::chrono::system_clock::now();
+  //   LOG_CERR("local_read_all_time::last::",
+  //            std::chrono::duration_cast<std::chrono::microseconds>(now_end -
+  //                                                                  now_start)
+  //                .count(),
+  //            ' ', "memtable_num::", cnt);
+  // }
   return false;
 }
 
@@ -226,8 +382,8 @@ void MemTableListVersion::AddIterators(const ReadOptions& options,
     if (!add_range_tombstone_iter || options.ignore_range_deletions) {
       merge_iter_builder->AddIterator(mem_iter);
     } else {
-      // Except for snapshot read, using kMaxSequenceNumber is OK because these
-      // are immutable memtables.
+      // Except for snapshot read, using kMaxSequenceNumber is OK because
+      // these are immutable memtables.
       SequenceNumber read_seq = options.snapshot != nullptr
                                     ? options.snapshot->GetSequenceNumber()
                                     : kMaxSequenceNumber;
@@ -321,7 +477,8 @@ void MemTableListVersion::Remove(MemTable* m,
   }
 }
 
-// return the total memory usage assuming the oldest flushed memtable is dropped
+// return the total memory usage assuming the oldest flushed memtable is
+// dropped
 size_t MemTableListVersion::MemoryAllocatedBytesExcludingLast() const {
   size_t total_memtable_size = 0;
   for (auto& memtable : memlist_) {
@@ -399,6 +556,7 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
   // ret is filled with memtables already sorted in increasing MemTable ID.
   // However, when the mempurge feature is activated, new memtables with older
   // IDs will be added to the memlist.
+  LOG_CERR("memlist::imm_size::", memlist.size());
   for (auto it = memlist.rbegin(); it != memlist.rend(); ++it) {
     MemTable* m = *it;
     if (!atomic_flush && m->atomic_flush_seqno_ != kMaxSequenceNumber) {
@@ -420,11 +578,12 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
       }
       ret->push_back(m);
     } else if (!ret->empty()) {
-      // This `break` is necessary to prevent picking non-consecutive memtables
-      // in case `memlist` has one or more entries with
+      // This `break` is necessary to prevent picking non-consecutive
+      // memtables in case `memlist` has one or more entries with
       // `flush_in_progress_ == true` sandwiched between entries with
-      // `flush_in_progress_ == false`. This could happen after parallel flushes
-      // are picked and the one flushing older memtables is rolled back.
+      // `flush_in_progress_ == false`. This could happen after parallel
+      // flushes are picked and the one flushing older memtables is rolled
+      // back.
       break;
     }
   }
@@ -458,15 +617,13 @@ void MemTableList::RollbackMemtableFlush(const autovector<MemTable*>& mems,
 Status MemTableList::TryInstallMemtableFlushResults(
     ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
     const autovector<MemTable*>& mems, LogsWithPrepTracker* prep_tracker,
-    VersionSet* vset, InstrumentedMutex* mu, uint64_t file_number,
-    autovector<MemTable*>* to_delete, FSDirectory* db_directory,
-    LogBuffer* log_buffer,
+    VersionSet* vset, InstrumentedMutex* mu, autovector<MemTable*>* to_delete,
+    FSDirectory* db_directory, LogBuffer* log_buffer,
     std::list<std::unique_ptr<FlushJobInfo>>* committed_flush_jobs_info,
-    bool write_edits) {
+    uint64_t* file_number, bool write_edits) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_MEMTABLE_INSTALL_FLUSH_RESULTS);
   mu->AssertHeld();
-
   // Flush was successful
   // Record the status on the memtable object. Either this call or a call by a
   // concurrent flush thread will read the status and write it to manifest.
@@ -475,7 +632,7 @@ Status MemTableList::TryInstallMemtableFlushResults(
     assert(i == 0 || mems[i]->GetEdits()->NumEntries() == 0);
 
     mems[i]->flush_completed_ = true;
-    mems[i]->file_number_ = file_number;
+    mems[i]->file_number_ = file_number[i];  // debug
   }
 
   // if some other thread is already committing, then return
@@ -493,10 +650,10 @@ Status MemTableList::TryInstallMemtableFlushResults(
   while (s.ok()) {
     auto& memlist = current_->memlist_;
     // The back is the oldest; if flush_completed_ is not set to it, it means
-    // that we were assigned a more recent memtable. The memtables' flushes must
-    // be recorded in manifest in order. A concurrent flush thread, who is
-    // assigned to flush the oldest memtable, will later wake up and does all
-    // the pending writes to manifest, in order.
+    // that we were assigned a more recent memtable. The memtables' flushes
+    // must be recorded in manifest in order. A concurrent flush thread, who
+    // is assigned to flush the oldest memtable, will later wake up and does
+    // all the pending writes to manifest, in order.
     if (memlist.empty() || !memlist.back()->flush_completed_) {
       break;
     }
@@ -507,7 +664,8 @@ Status MemTableList::TryInstallMemtableFlushResults(
     size_t batch_count = 0;
     autovector<VersionEdit*> edit_list;
     autovector<MemTable*> memtables_to_flush;
-    // enumerate from the last (earliest) element to see how many batch finished
+    // enumerate from the last (earliest) element to see how many batch
+    // finished
     for (auto it = memlist.rbegin(); it != memlist.rend(); ++it) {
       MemTable* m = *it;
       if (!m->flush_completed_) {
@@ -526,7 +684,6 @@ Status MemTableList::TryInstallMemtableFlushResults(
                            cfd->GetName().c_str(), m->file_number_,
                            m->edit_.GetBlobFileAdditions().size());
         }
-
         edit_list.push_back(&m->edit_);
         memtables_to_flush.push_back(m);
         std::unique_ptr<FlushJobInfo> info = m->ReleaseFlushJobInfo();

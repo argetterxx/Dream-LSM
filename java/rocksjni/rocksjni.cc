@@ -1693,7 +1693,7 @@ jint Java_org_rocksdb_RocksDB_get__JJ_3BII_3BIIJ(
 inline void multi_get_helper_release_keys(std::vector<jbyte*>& keys_to_free) {
   auto end = keys_to_free.end();
   for (auto it = keys_to_free.begin(); it != end; ++it) {
-    delete[] * it;
+    delete[] *it;
   }
   keys_to_free.clear();
 }

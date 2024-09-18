@@ -25,6 +25,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/listener.h"
+#include "rocksdb/remote_flush_service.h"
 #include "rocksdb/sst_partitioner.h"
 #include "rocksdb/types.h"
 #include "rocksdb/universal_compaction.h"
@@ -63,6 +64,10 @@ struct DbPath;
 using FileTypeSet = SmallEnumSet<FileType, FileType::kBlobFile>;
 
 struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
+ public:
+  void PackLocal(TransferService* node) const;
+  static void* UnPackLocal(TransferService* node);
+
   // The function recovers options to a previous version. Only 4.6 or later
   // versions are supported.
   // NOT MAINTAINED: This function has not been and is not maintained.
@@ -1393,6 +1398,12 @@ struct DBOptions {
   // of the contract leads to undefined behaviors with high possibility of data
   // inconsistency, e.g. deleted old data become visible again, etc.
   bool enforce_single_del_contracts = true;
+
+  size_t worker_use_remote_flush = 0;
+  size_t server_remote_flush = 0;
+
+  std::string rdma_tcp_addr_ = "127.0.0.1";
+  int rdma_tcp_port_ = 9000;
 };
 
 // Options to control the behavior of a database (passed to DB::Open)

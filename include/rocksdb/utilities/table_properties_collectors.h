@@ -7,6 +7,7 @@
 #include <atomic>
 #include <memory>
 
+#include "rocksdb/remote_flush_service.h"
 #include "rocksdb/table_properties.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -17,6 +18,20 @@ namespace ROCKSDB_NAMESPACE {
 // entries in the whole file >= the specified deletion ratio.
 class CompactOnDeletionCollectorFactory
     : public TablePropertiesCollectorFactory {
+ public:
+  void PackLocal(TransferService* node) const override {
+    size_t msg_len = sizeof(size_t) + sizeof(size_t) * 2 + sizeof(double);
+    char* msg = reinterpret_cast<char*>(malloc(msg_len));
+    *reinterpret_cast<size_t*>(msg) = 2;
+    *reinterpret_cast<size_t*>(msg + sizeof(size_t)) =
+        sliding_window_size_.load();
+    *reinterpret_cast<size_t*>(msg + sizeof(size_t) * 2) =
+        deletion_trigger_.load();
+    *reinterpret_cast<double*>(msg + sizeof(size_t) * 2 + sizeof(size_t)) =
+        deletion_ratio_.load();
+    node->send(msg, msg_len);
+  }
+
  public:
   // A factory of a table property collector that marks a SST
   // file as need-compaction when it observe at least "D" deletion
@@ -85,4 +100,3 @@ NewCompactOnDeletionCollectorFactory(size_t sliding_window_size,
                                      size_t deletion_trigger,
                                      double deletion_ratio = 0);
 }  // namespace ROCKSDB_NAMESPACE
-

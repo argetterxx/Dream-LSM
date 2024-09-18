@@ -75,4 +75,23 @@ extern Status BuildTable(
     uint64_t* memtable_payload_bytes = nullptr,
     uint64_t* memtable_garbage_bytes = nullptr);
 
+extern Status RemoteBuildTable(
+    const std::string& dbname, VersionSet* versions,
+    const ImmutableDBOptions& db_options, const TableBuilderOptions& tboptions,
+    const FileOptions& file_options, InternalIterator* iter,
+    std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
+        range_del_iters,
+    FileMetaData* meta, std::vector<SequenceNumber> snapshots,
+    SequenceNumber earliest_write_conflict_snapshot,
+    SequenceNumber job_snapshot, SnapshotChecker* snapshot_checker,
+    bool paranoid_file_checks, IOStatus* io_status,
+    const SeqnoToTimeMapping& seqno_to_time_mapping, int job_id = 0,
+    const Env::IOPriority io_priority = Env::IO_HIGH,
+    TableProperties* table_properties = nullptr,
+    Env::WriteLifeTimeHint write_hint = Env::WLTH_NOT_SET,
+    const std::string* full_history_ts_low = nullptr,
+    Version* version = nullptr, uint64_t* num_input_entries = nullptr,
+    uint64_t* memtable_payload_bytes = nullptr,
+    uint64_t* memtable_garbage_bytes = nullptr);
+
 }  // namespace ROCKSDB_NAMESPACE

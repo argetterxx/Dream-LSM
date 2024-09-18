@@ -8,12 +8,20 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 
+#include <asm-generic/socket.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <atomic>
+#include <cassert>
+#include <chrono>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <limits>
 #include <list>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -38,6 +46,7 @@
 #include "db/pre_release_callback.h"
 #include "db/range_del_aggregator.h"
 #include "db/read_callback.h"
+#include "db/remote_flush_job.h"
 #include "db/seqno_to_time_mapping.h"
 #include "db/snapshot_checker.h"
 #include "db/snapshot_impl.h"
@@ -50,9 +59,12 @@
 #include "monitoring/instrumented_mutex.h"
 #include "options/db_options.h"
 #include "port/port.h"
+#include "rocksdb/configurable.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/memtablerep.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/status.h"
 #include "rocksdb/trace_reader_writer.h"
 #include "rocksdb/transaction_log.h"
@@ -186,6 +198,9 @@ class DBImpl : public DB {
 
   using DB::Resume;
   Status Resume() override;
+
+  using DB::ListenAndScheduleFlushJob;
+  Status ListenAndScheduleFlushJob(int port) override;
 
   using DB::Put;
   Status Put(const WriteOptions& options, ColumnFamilyHandle* column_family,
@@ -481,8 +496,7 @@ class DBImpl : public DB {
   virtual Status GetSortedWalFiles(VectorLogPtr& files) override;
   virtual Status GetCurrentWalFile(
       std::unique_ptr<LogFile>* current_log_file) override;
-  virtual Status GetCreationTimeOfOldestFile(
-      uint64_t* creation_time) override;
+  virtual Status GetCreationTimeOfOldestFile(uint64_t* creation_time) override;
 
   virtual Status GetUpdatesSince(
       SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
@@ -598,7 +612,6 @@ class DBImpl : public DB {
   virtual Status GetPropertiesOfTablesInRange(
       ColumnFamilyHandle* column_family, const Range* range, std::size_t n,
       TablePropertiesCollection* props) override;
-
 
   // ---- End of implementations of the DB interface ----
   SystemClock* GetSystemClock() const;
@@ -1702,6 +1715,22 @@ class DBImpl : public DB {
 
     Env::Priority thread_pri_;
   };
+  struct RemoteFlushThreadArg {
+    DBImpl* db_;
+    Env::Priority thread_pri_;
+    int sockfd_;
+#ifdef ROCKSDB_RDMA
+    RDMAClient* rdma_client_;
+    struct RDMANode::rdma_connection* rdma_conn_;
+    std::atomic<RDMANode::rdma_connection*>* rdma_conn_ret_;
+    std::pair<int64_t, int64_t> remote_seg_;
+#endif
+  };
+
+  struct RflushThreadArg {
+    DBImpl* db_;
+    std::chrono::time_point<std::chrono::system_clock> trigger_rflush_time_;
+  };
 
   // Information for a manual compaction
   struct ManualCompactionState {
@@ -1734,8 +1763,8 @@ class DBImpl : public DB {
     const InternalKey* begin = nullptr;  // nullptr means beginning of key range
     const InternalKey* end = nullptr;    // nullptr means end of key range
     InternalKey* manual_end = nullptr;   // how far we are compacting
-    InternalKey tmp_storage;      // Used to keep track of compaction progress
-    InternalKey tmp_storage1;     // Used to keep track of compaction progress
+    InternalKey tmp_storage;   // Used to keep track of compaction progress
+    InternalKey tmp_storage1;  // Used to keep track of compaction progress
 
     // When the user provides a canceled pointer in CompactRangeOptions, the
     // above varaibe is the reference of the user-provided
@@ -2067,9 +2096,22 @@ class DBImpl : public DB {
   // separate, bottom-pri thread pool.
   static void BGWorkBottomCompaction(void* arg);
   static void BGWorkFlush(void* arg);
+  static void BGListenWorkFlush(void* arg);
   static void BGWorkPurge(void* arg);
+  static void BGWorkRemoteFlush(void* arg);
+  static void UnscheduleRemoteFlushCallback(void* arg);
   static void UnscheduleCompactionCallback(void* arg);
   static void UnscheduleFlushCallback(void* arg);
+  static void UnscheduleListenFlushCallback(void* arg);
+  void BackgroundCallRemoteFlush(
+      int sockfd,
+#ifdef ROCKSDB_RDMA
+      RDMAClient* rdma_client, struct RDMANode::rdma_connection* conn,
+      std::pair<int64_t, int64_t> remote_seg,
+      std::atomic<RDMANode::rdma_connection*>* rdma_conn_ret,
+#endif  // ROCKSDB_RDMA
+      Env::Priority thread_pri);
+  void BGListenRemoteFlush(RflushThreadArg* arg);
   void BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 Env::Priority thread_pri);
   void BackgroundCallFlush(Env::Priority thread_pri);
@@ -2704,6 +2746,70 @@ class DBImpl : public DB {
   // The number of LockWAL called without matching UnlockWAL call.
   // See also lock_wal_write_token_
   uint32_t lock_wal_count_;
+
+  // remote flush
+  std::mutex transfer_mutex_;
+  std::atomic<int> port_index_ = {0};
+  std::vector<std::pair<std::string, size_t>> memnodes_ip_port_;
+  std::string local_ip_;
+  PDClient* pd_connection_client_{nullptr};
+
+#ifdef ROCKSDB_RDMA
+  RDMAClient* rdma_client_;
+  inline Status InitRDMAClient() {
+    rdma_client_ = new RDMAClient();
+    rdma_client_->resources_create(1ull << 28);
+    rdma_client_->rdma_mem_.init(rdma_client_->buf_size);
+    return Status::OK();
+  }
+#endif
+
+ public:
+  inline placement_info CollectPlacementInfo() {
+    placement_info pinfo;
+    pinfo.current_background_job_num_ = bg_bottom_compaction_scheduled_ +
+                                        bg_compaction_scheduled_ +
+                                        bg_flush_scheduled_;
+    pinfo.current_hdfs_io_ = fs_->get_writein_speed();
+    return pinfo;
+  }
+
+  inline void register_local_ip(const std::string& ip) override {
+    local_ip_ = ip;
+  }
+
+  inline void register_memnode(const std::string& ip, size_t port,
+                               int conn_cnt) override {
+    std::lock_guard<std::mutex> lock(transfer_mutex_);
+    memnodes_ip_port_.push_back(std::make_pair(ip, port));
+  }
+
+  inline void unregister_memnode(const std::string& ip, size_t port) override {
+    std::lock_guard<std::mutex> lock(transfer_mutex_);
+    for (auto it = memnodes_ip_port_.begin(); it != memnodes_ip_port_.end();
+         it++) {
+      if (it->first == ip && it->second == port) {
+        memnodes_ip_port_.erase(it);
+        break;
+      }
+    }
+  }
+  inline void register_pd_client(const PDClient* pd_client) override {
+    assert(pd_connection_client_ == nullptr);
+    std::lock_guard<std::mutex> lck(pd_client->get_mutex());
+    pd_connection_client_ = const_cast<PDClient*>(pd_client);
+    pd_connection_client_->set_get_placement_info(
+        std::bind(&DBImpl::CollectPlacementInfo, this));
+    assert(pd_connection_client_ != nullptr);
+  }
+  inline void unregister_pd_client() override {
+    assert(pd_connection_client_ != nullptr);
+    std::lock_guard<std::mutex> lck(pd_connection_client_->get_mutex());
+    pd_connection_client_->set_get_placement_info([]() -> placement_info {
+      return {0, 0};
+    });
+    pd_connection_client_ = nullptr;
+  }
 };
 
 class GetWithTimestampReadCallback : public ReadCallback {

@@ -10,7 +10,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -21,10 +26,14 @@
 #include "db/write_batch_internal.h"
 #include "db/write_controller.h"
 #include "options/cf_options.h"
+#include "rocksdb/blockingconcurrentqueue.h"
 #include "rocksdb/compaction_job_stats.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/file_system.h"
 #include "rocksdb/options.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "trace_replay/block_cache_tracer.h"
 #include "util/hash_containers.h"
 #include "util/thread_local.h"
@@ -268,6 +277,36 @@ class ColumnFamilySet;
 // Most methods require DB mutex held, unless otherwise noted
 class ColumnFamilyData {
  public:
+  struct built_memreg_info {
+    // size_t imm_index_meta_local_offset;
+    // std::pair<size_t, size_t> imm_index_meta_remote_offset;
+    std::map<RDMANode::rdma_connection*,
+             std::pair<int64_t, std::pair<int64_t, int64_t>>>
+        index_mp;
+    int64_t rf_meta_local_offset;
+    std::pair<int64_t, int64_t> rf_meta_remote_offset;
+  };
+  void register_imm_trans(MemTable* memtable, bool need_mark) {
+    std::lock_guard<std::mutex> lck(imm_que_mtx);
+    memtable->Ref();
+    imm_que->enqueue({{memtable, memtable->get_conn().second},
+                      {need_mark, std::chrono::high_resolution_clock::now()}});
+  }
+  uint64_t get_trans_mem_accumulated_id() {
+    return trans_mem_accumulated_id.load();
+  }
+  Status background_schedule_imm_trans();
+  Status flush_imm_trans();
+  void free_remote();
+  void PackLocal(TransferService* node, InstrumentedMutex* db_mutex) const;
+  void DoubleCheck(TransferService* node) const;
+  static void* UnPackLocal(TransferService* node);
+  void PackRemote(TransferService* node) const;
+  void UnPackRemote(TransferService* node);
+  Status init_cf_level_rdma_client(std::string& ip, int port);
+  inline built_memreg_info* get_built_memreg_info() { return reginfo_; }
+
+ public:
   ~ColumnFamilyData();
 
   // thread-safe
@@ -295,10 +334,11 @@ class ColumnFamilyData {
   // access data from dropped column family.
   // Column family can be dropped and still alive. In that state:
   // *) Compaction and flush is not executed on the dropped column family.
-  // *) Client can continue reading from column family. Writes will fail unless
-  // WriteOptions::ignore_missing_column_families is true
-  // When the dropped column family is unreferenced, then we:
-  // *) Remove column family from the linked list maintained by ColumnFamilySet
+  // *) Client can continue reading from column family. Writes will fail
+  // unless WriteOptions::ignore_missing_column_families is true When the
+  // dropped column family is unreferenced, then we:
+  // *) Remove column family from the linked list maintained by
+  // ColumnFamilySet
   // *) delete all memory associated with that column family
   // *) delete all the files associated with that column family
   void SetDropped();
@@ -538,9 +578,32 @@ class ColumnFamilyData {
   // Recover the next epoch number of this CF and epoch number
   // of its files (if missing)
   void RecoverEpochNumbers();
+  inline RDMANode::rdma_connection* try_get_meta_conn() {
+    return meta_conn_.exchange(nullptr);
+  }
+  inline void putback_meta_conn(RDMANode::rdma_connection* conn) {
+    meta_conn_.store(conn);
+  }
+  inline RDMAClient* get_cflevel_client() { return cflevel_client_; }
+  inline RDMAReadClient* get_cflevel_read_client() {
+    return cflevel_read_client_;
+  }
+  inline RDMANode::rdma_connection* get_cflevel_read_connection() {
+    RDMANode::rdma_connection* ptr = nullptr;
+    while (ptr == nullptr) {
+      LOG("waiting for cflevel read connection");
+      delegated_read_conns_.wait_dequeue_timed(ptr,
+                                               std::chrono::microseconds(1));
+    }
+    return ptr;
+  }
+  inline void put_cflevel_read_connection(RDMANode::rdma_connection* conn) {
+    delegated_read_conns_.enqueue(conn);
+  }
 
  private:
   friend class ColumnFamilySet;
+  friend class RDMANode;
   ColumnFamilyData(uint32_t id, const std::string& name,
                    Version* dummy_versions, Cache* table_cache,
                    WriteBufferManager* write_buffer_manager,
@@ -555,7 +618,7 @@ class ColumnFamilyData {
   std::vector<std::string> GetDbPaths() const;
 
   uint32_t id_;
-  const std::string name_;
+  std::string name_;
   Version* dummy_versions_;  // Head of circular doubly-linked list of versions.
   Version* current_;         // == dummy_versions->prev_
 
@@ -594,8 +657,8 @@ class ColumnFamilyData {
   std::unique_ptr<ThreadLocalPtr> local_sv_;
 
   // pointers for a circular linked list. we use it to support iterations over
-  // all column families that are alive (note: dropped column families can also
-  // be alive as long as client holds a reference)
+  // all column families that are alive (note: dropped column families can
+  // also be alive as long as client holds a reference)
   ColumnFamilyData* next_;
   ColumnFamilyData* prev_;
 
@@ -612,7 +675,8 @@ class ColumnFamilyData {
 
   std::unique_ptr<WriteControllerToken> write_controller_token_;
 
-  // If true --> this ColumnFamily is currently present in DBImpl::flush_queue_
+  // If true --> this ColumnFamily is currently present in
+  // DBImpl::flush_queue_
   bool queued_for_flush_;
 
   // If true --> this ColumnFamily is currently present in
@@ -634,20 +698,43 @@ class ColumnFamilyData {
 
   std::string full_history_ts_low_;
 
-  // For charging memory usage of file metadata created for newly added files to
-  // a Version associated with this CFD
+  // For charging memory usage of file metadata created for newly added files
+  // to a Version associated with this CFD
   std::shared_ptr<CacheReservationManager> file_metadata_cache_res_mgr_;
   bool mempurge_used_;
 
   std::atomic<uint64_t> next_epoch_number_;
+  std::atomic<RDMANode::rdma_connection*> meta_conn_;
+
+  std::queue<RDMANode::rdma_connection*>
+      memtable_conn_;  // available connection queue
+  std::mutex memtable_conn_mtx_;
+  std::vector<std::thread*> memtable_thread;
+  std::atomic<uint64_t> trans_mem_accumulated_id;
+  moodycamel::BlockingConcurrentQueue<std::pair<
+      std::pair<MemTable*, RDMANode::rdma_connection*>,
+      std::pair<bool, std::chrono::high_resolution_clock::time_point>>>*
+      imm_que;
+  RDMANode::rdma_connection* gc_conn_{nullptr};
+  std::queue<std::pair<uint64_t, uint64_t>> gc_queue_;
+  std::thread* gc_thread_{nullptr};
+  RDMAReadClient* cflevel_read_client_{nullptr};
+  // std::vector<std::atomic<RDMANode::rdma_connection*>> delegated_read_conns_
+  moodycamel::BlockingConcurrentQueue<RDMANode::rdma_connection*>
+      delegated_read_conns_;
+
+  RDMAClient* cflevel_client_{nullptr};
+  built_memreg_info* reginfo_{nullptr};
+  std::mutex imm_que_mtx;
+  std::pair<std::string, size_t>* memtable_ip_port{nullptr};
+  std::atomic<bool> should_drop{false};
 };
 
 // ColumnFamilySet has interesting thread-safety requirements
-// * CreateColumnFamily() or RemoveColumnFamily() -- need to be protected by DB
-// mutex AND executed in the write thread.
-// CreateColumnFamily() should ONLY be called from VersionSet::LogAndApply() AND
-// single-threaded write thread. It is also called during Recovery and in
-// DumpManifest().
+// * CreateColumnFamily() or RemoveColumnFamily() -- need to be protected by
+// DB mutex AND executed in the write thread. CreateColumnFamily() should ONLY
+// be called from VersionSet::LogAndApply() AND single-threaded write thread.
+// It is also called during Recovery and in DumpManifest().
 // RemoveColumnFamily() is only called from SetDropped(). DB mutex needs to be
 // held and it needs to be executed from the write thread. SetDropped() also
 // guarantees that it will be called only from single-threaded LogAndApply(),
@@ -734,10 +821,10 @@ class ColumnFamilySet {
   const FileOptions file_options_;
 
   ColumnFamilyData* dummy_cfd_;
-  // We don't hold the refcount here, since default column family always exists
-  // We are also not responsible for cleaning up default_cfd_cache_. This is
-  // just a cache that makes common case (accessing default column family)
-  // faster
+  // We don't hold the refcount here, since default column family always
+  // exists We are also not responsible for cleaning up default_cfd_cache_.
+  // This is just a cache that makes common case (accessing default column
+  // family) faster
   ColumnFamilyData* default_cfd_cache_;
 
   const std::string db_name_;
@@ -749,6 +836,7 @@ class ColumnFamilySet {
   std::shared_ptr<IOTracer> io_tracer_;
   const std::string& db_id_;
   std::string db_session_id_;
+  RDMAClient* client_;
 };
 
 // A wrapper for ColumnFamilySet that supports releasing DB mutex during each

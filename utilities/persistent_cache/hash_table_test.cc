@@ -17,7 +17,6 @@
 #include "util/random.h"
 #include "utilities/persistent_cache/hash_table_evictable.h"
 
-
 namespace ROCKSDB_NAMESPACE {
 
 struct HashTableTest : public testing::Test {

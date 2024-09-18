@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include "rocksdb/env_encryption.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -111,4 +110,3 @@ Status NewEncryptedFileSystemImpl(
     std::unique_ptr<FileSystem>* fs);
 
 }  // namespace ROCKSDB_NAMESPACE
-

@@ -8,6 +8,8 @@
 #include <string>
 
 #include "rocksdb/options.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/table.h"
 #include "util/murmurhash.h"
 
@@ -51,6 +53,12 @@ static inline uint64_t CuckooHash(
 // - Does not support Merge operations.
 // - Does not support prefix bloom filters.
 class CuckooTableFactory : public TableFactory {
+ public:
+  void PackLocal(TransferService* node) const override {
+    size_t msg = 2;
+    node->send(&msg, sizeof(msg));
+  }
+
  public:
   explicit CuckooTableFactory(
       const CuckooTableOptions& table_option = CuckooTableOptions());

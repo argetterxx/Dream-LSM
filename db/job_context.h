@@ -9,12 +9,20 @@
 
 #pragma once
 
+#include <unistd.h>
+
+#include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "db/column_family.h"
 #include "db/log_writer.h"
 #include "db/version_set.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
+#include "rocksdb/types.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -94,6 +102,7 @@ struct SuperVersionContext {
       delete s;
     }
     superversions_to_free.clear();
+    LOG("SuperVersionContext::Clean() done 2");
   }
 
   ~SuperVersionContext() {
@@ -105,6 +114,11 @@ struct SuperVersionContext {
 };
 
 struct JobContext {
+ public:
+  void PackLocal(TransferService* node) const;
+  static void* UnPackLocal(TransferService* node);
+
+ public:
   inline bool HaveSomethingToDelete() const {
     return !(full_scan_candidate_files.empty() && sst_delete_files.empty() &&
              blob_delete_files.empty() && log_delete_files.empty() &&
@@ -212,6 +226,7 @@ struct JobContext {
   // doing potentially slow Clean() with locked DB mutex.
   void Clean() {
     // free superversions
+    LOG("JobContext::Clean()");
     for (auto& sv_context : superversion_contexts) {
       sv_context.Clean();
     }
@@ -226,6 +241,7 @@ struct JobContext {
     memtables_to_free.clear();
     logs_to_free.clear();
     job_snapshot.reset();
+    LOG("JobContext::Clean() done 4");
   }
 
   ~JobContext() {
@@ -233,5 +249,24 @@ struct JobContext {
     assert(logs_to_free.size() == 0);
   }
 };
+
+inline void JobContext::PackLocal(TransferService* node) const {
+  LOG("JobContext::PackLocal");
+  node->send(reinterpret_cast<const void*>(this), sizeof(JobContext));
+  assert(job_snapshot == nullptr);
+}
+
+inline void* JobContext::UnPackLocal(TransferService* node) {
+  size_t empty = 0;
+  node->receive(&empty, sizeof(size_t));
+  if (empty == 0) {
+    LOG("JobContext::UnPackLocal empty");
+    return nullptr;
+  }
+  LOG("JobContext::UnPackLocal");
+  void* mem = malloc(sizeof(JobContext));
+  node->receive(mem, sizeof(JobContext));
+  return mem;
+}
 
 }  // namespace ROCKSDB_NAMESPACE

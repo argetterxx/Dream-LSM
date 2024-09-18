@@ -10,7 +10,6 @@
 // inserted.
 #pragma once
 
-
 #include <memory>
 #include <string>
 #include <vector>
@@ -304,4 +303,3 @@ class WriteBatchWithIndex : public WriteBatchBase {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

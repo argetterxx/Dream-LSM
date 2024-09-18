@@ -12,14 +12,18 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <string>
 
 #include "db/dbformat.h"
 #include "port/lang.h"
 #include "port/port.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/utilities/customizable_util.h"
 #include "rocksdb/utilities/object_registry.h"
@@ -27,7 +31,15 @@
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
+
 class BytewiseComparatorImpl : public Comparator {
+ public:
+  void PackLocal(TransferService* node) const override {
+    LOG("BytewiseComparatorImpl::PackLocal");
+    uint8_t msg = 0;
+    node->send(&msg, sizeof(msg));
+  }
+
  public:
   BytewiseComparatorImpl() {}
   static const char* kClassName() { return "leveldb.BytewiseComparator"; }
@@ -146,6 +158,13 @@ class BytewiseComparatorImpl : public Comparator {
 };
 
 class ReverseBytewiseComparatorImpl : public BytewiseComparatorImpl {
+ public:
+  void PackLocal(TransferService* node) const override {
+    LOG("ReverseBytewiseComparatorImpl::PackLocal");
+    uint8_t msg = 1;
+    node->send(&msg, sizeof(msg));
+  }
+
  public:
   ReverseBytewiseComparatorImpl() {}
 

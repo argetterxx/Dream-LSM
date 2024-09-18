@@ -9,6 +9,7 @@
 
 #include "rocksdb/c.h"
 
+#include <cassert>
 #include <cstdlib>
 #include <map>
 #include <unordered_set>
@@ -29,6 +30,8 @@
 #include "rocksdb/options.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/rate_limiter.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
@@ -482,6 +485,7 @@ struct rocksdb_env_t {
 };
 
 struct rocksdb_slicetransform_t : public SliceTransform {
+ public:
   void* state_;
   void (*destructor_)(void*);
   const char* (*name_)(void*);
@@ -5148,7 +5152,8 @@ rocksdb_fifo_compaction_options_t* rocksdb_fifo_compaction_options_create() {
 }
 
 void rocksdb_fifo_compaction_options_set_allow_compaction(
-    rocksdb_fifo_compaction_options_t* fifo_opts, unsigned char allow_compaction) {
+    rocksdb_fifo_compaction_options_t* fifo_opts,
+    unsigned char allow_compaction) {
   fifo_opts->rep.allow_compaction = allow_compaction;
 }
 

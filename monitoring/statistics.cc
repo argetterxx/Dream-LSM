@@ -295,6 +295,18 @@ static int RegisterBuiltinStatistics(ObjectLibrary& library,
   return 1;
 }
 
+void* Statistics::UnPackLocal(TransferService* node) {
+  bool signal = false;
+  node->receive(&signal, sizeof(bool));
+  if (signal) {
+    auto* stats = new std::shared_ptr<Statistics>(nullptr);
+    Statistics::CreateFromString(ConfigOptions(), "", stats);
+    return reinterpret_cast<void*>(stats);
+  } else {
+    return nullptr;
+  }
+}
+
 Status Statistics::CreateFromString(const ConfigOptions& config_options,
                                     const std::string& id,
                                     std::shared_ptr<Statistics>* result) {
@@ -363,6 +375,7 @@ std::string StatisticsImpl::getHistogramString(uint32_t histogramType) const {
 }
 
 void StatisticsImpl::setTickerCount(uint32_t tickerType, uint64_t count) {
+  if (get_remote_trigger()) record_remote_set_ticker_count(tickerType, count);
   {
     MutexLock lock(&aggregate_lock_);
     setTickerCountLocked(tickerType, count);
@@ -401,6 +414,7 @@ uint64_t StatisticsImpl::getAndResetTickerCount(uint32_t tickerType) {
 }
 
 void StatisticsImpl::recordTick(uint32_t tickerType, uint64_t count) {
+  if (get_remote_trigger()) record_remote_tick(tickerType, count);
   if (get_stats_level() <= StatsLevel::kExceptTickers) {
     return;
   }

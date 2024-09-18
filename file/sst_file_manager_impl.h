@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <string>
 
 #include "db/compaction/compaction.h"
@@ -190,4 +189,3 @@ class SstFileManagerImpl : public SstFileManager {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

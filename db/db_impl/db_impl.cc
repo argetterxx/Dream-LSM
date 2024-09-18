@@ -8,14 +8,40 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "db/db_impl/db_impl.h"
 
+#include <fcntl.h>
 #include <stdint.h>
+
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <thread>
+
+#include "db/remote_flush_job.h"
+#include "db/tcprw.h"
+#include "memory/remote_memtable_service.h"
+#include "rocksdb/configurable.h"
+#include "rocksdb/memtablerep.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #ifdef OS_SOLARIS
 #include <alloca.h>
 #endif
 
+// for socket API
+#ifdef __linux
+#include <netinet/in.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif  //__linux
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
+#include <iostream>
 #include <map>
 #include <set>
 #include <sstream>
@@ -276,9 +302,10 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
                                  table_cache_.get(), write_buffer_manager_,
                                  &write_controller_, &block_cache_tracer_,
                                  io_tracer_, db_id_, db_session_id_));
+  LOG("Open ColumnFamilyMemTablesImpl");
   column_family_memtables_.reset(
       new ColumnFamilyMemTablesImpl(versions_->GetColumnFamilySet()));
-
+  LOG("Open ColumnFamilyMemTablesImpl finish");
   DumpRocksDBBuildVersion(immutable_db_options_.info_log.get());
   DumpDBFileSummary(immutable_db_options_, dbname_, db_session_id_);
   immutable_db_options_.Dump(immutable_db_options_.info_log.get());
@@ -290,6 +317,272 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   if (write_buffer_manager_) {
     wbm_stall_.reset(new WBMStallInterface());
   }
+}
+
+void DBImpl::BackgroundCallRemoteFlush(
+    int sockfd, RDMAClient* rdma_client,
+    struct RDMANode::rdma_connection* rdma_conn,
+    std::pair<int64_t, int64_t> remote_seg,
+    std::atomic<RDMANode::rdma_connection*>* rdma_conn_ret,
+    Env::Priority thread_pri) {
+  TEST_SYNC_POINT("DBImpl::BackgroundCallRemoteFlush:Start");
+  std::chrono::high_resolution_clock::time_point tt =
+      std::chrono::high_resolution_clock::now();
+  int64_t local_offset =
+      rdma_client->rdma_mem_.allocate(remote_seg.second - remote_seg.first);
+  assert(remote_seg.second - remote_seg.first == 98304);
+  assert(local_offset != -1);
+  rdma_client->rdma_read(rdma_conn, remote_seg.second - remote_seg.first,
+                         local_offset, remote_seg.first);
+  ASSERT_RW(rdma_client->poll_completion(rdma_conn) == 0);
+  std::chrono::high_resolution_clock::time_point tta =
+      std::chrono::high_resolution_clock::now();
+  LOG_CERR(
+      "fetch flush metadata:: ",
+      std::chrono::duration_cast<std::chrono::microseconds>(tta - tt).count());
+  char req_type = 2;
+  ASSERT_RW(writen(rdma_conn->sock, &req_type, sizeof(char)) == sizeof(char));
+  rdma_client->free_mem_request(rdma_conn, remote_seg.first,
+                                remote_seg.second - remote_seg.first);
+  RDMATransferService transfer_service(rdma_client, local_offset);
+
+  size_t memtable_size = 0;
+  std::vector<MemTable*> tmp_memtables_;
+  std::vector<RemoteMemTable*> tmp_memreps_;
+  transfer_service.receive(&memtable_size, sizeof(size_t));
+  std::chrono::high_resolution_clock::time_point tp =
+      std::chrono::high_resolution_clock::now();
+  for (int i = 0; i < memtable_size; i++) {
+    uint64_t mixed_id = 0;
+    transfer_service.receive(&mixed_id, sizeof(uint64_t));
+    void *index = nullptr, *meta = nullptr;
+    uint64_t index_size = 0, meta_size = 0;
+    std::pair<void*, uint64_t> mem_data[4] = {
+        {nullptr, 0}, {nullptr, 0}, {nullptr, 0}, {nullptr, 0}};
+    LOG_CERR("worker need to fetch memtable ", mixed_id);
+    std::chrono::high_resolution_clock::time_point t0 =
+        std::chrono::high_resolution_clock::now();
+    char req_type = 10;
+    ASSERT_RW(writen(rdma_conn->sock, &req_type, sizeof(char)) == sizeof(char));
+    rdma_client->fetch_memtable_request(rdma_conn, mixed_id, index, index_size,
+                                        meta, meta_size, mem_data);
+    std::chrono::high_resolution_clock::time_point t1 =
+        std::chrono::high_resolution_clock::now();
+
+    RemoteMemTable* rep = nullptr;
+    RemoteMemTable::register_remote_memTable(rep, rdma_client->get_buf(), index,
+                                             index_size, meta, meta_size,
+                                             mem_data);
+    RemoteMemTable::rebuild_remote_memTable(rep, rdma_client->get_buf(), index,
+                                            index_size, meta, meta_size,
+                                            mem_data);
+    std::chrono::high_resolution_clock::time_point t2 =
+        std::chrono::high_resolution_clock::now();
+    tmp_memreps_.emplace_back(rep);
+    LOG_CERR(
+        "fetch_memtable:: ", mixed_id, ' ',
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+        ' ',
+        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
+  }
+  std::chrono::high_resolution_clock::time_point tpa =
+      std::chrono::high_resolution_clock::now();
+  LOG_CERR(
+      "fetch ", memtable_size, " memtables:: ",
+      std::chrono::duration_cast<std::chrono::microseconds>(tpa - tp).count());
+
+  // double pack
+  for (int i = 0; i < memtable_size; i++) {
+    auto* memtable = reinterpret_cast<MemTable*>(
+        MemTable::UnPackLocal(&transfer_service, tmp_memreps_[i]->memtable));
+    tmp_memtables_.emplace_back(memtable);
+  }
+
+  auto* local_handler =
+      reinterpret_cast<RemoteFlushJob*>(RemoteFlushJob::UnPackLocal(
+          rdma_client, &transfer_service, this, tmp_memtables_));
+
+  LOG_CERR("Start PreCheck");
+  LOG_CERR("Finish PreCheck");
+
+  // double pack finish
+
+  int flush_job_generator_port = 0;
+  transfer_service.receive(&flush_job_generator_port, sizeof(int));
+  size_t ip_size = 0;
+  transfer_service.receive(&ip_size, sizeof(size_t));
+  std::string flush_job_generator_ip_str;
+  if (ip_size > 0) {
+    flush_job_generator_ip_str.resize(ip_size);
+    transfer_service.receive(flush_job_generator_ip_str.data(), ip_size);
+  }
+
+  rdma_conn_ret->store(rdma_conn);
+  rdma_conn = nullptr;
+  rdma_client->rdma_mem_.free(local_offset);
+
+  std::chrono::high_resolution_clock::time_point tpb =
+      std::chrono::high_resolution_clock::now();
+  LOG_CERR(
+      "unpackLocal:: ",
+      std::chrono::duration_cast<std::chrono::microseconds>(tpb - tpa).count());
+  local_handler->RunLocal();
+  std::chrono::high_resolution_clock::time_point tpc =
+      std::chrono::high_resolution_clock::now();
+
+  TCPNode unpack_tcp_node({}, 0);
+  if ((unpack_tcp_node.connection_info_.client_sockfd =
+           socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    LOG_CERR("socket creation error");
+    assert(false);
+  }
+  memset(reinterpret_cast<void*>(&unpack_tcp_node.connection_info_.sin_addr), 0,
+         sizeof(struct sockaddr_in));
+  unpack_tcp_node.connection_info_.sin_addr.sin_family = AF_INET;
+  unpack_tcp_node.connection_info_.sin_addr.sin_port =
+      htons(static_cast<uint16_t>(flush_job_generator_port));
+  if (inet_pton(AF_INET, flush_job_generator_ip_str.c_str(),
+                &unpack_tcp_node.connection_info_.sin_addr.sin_addr) <= 0) {
+    LOG_CERR("Invalid address/ Address not supported");
+    assert(false);
+  }
+  if (connect(unpack_tcp_node.connection_info_.client_sockfd,
+              reinterpret_cast<struct sockaddr*>(
+                  &unpack_tcp_node.connection_info_.sin_addr),
+              sizeof(unpack_tcp_node.connection_info_.sin_addr)) < 0) {
+    LOG_CERR("Connection Failed");
+    assert(false);
+  }
+  LOG_CERR("worker send update information to generator: ",
+           flush_job_generator_ip_str, ':', flush_job_generator_port);
+
+  // double check
+  LOG_CERR("Start PostCheck");
+  LOG_CERR("Finish PostCheck");
+  // double check finish
+
+  TCPTransferService local_transfer_service(&unpack_tcp_node);
+  local_handler->PackRemote(&local_transfer_service);
+  close(unpack_tcp_node.connection_info_.client_sockfd);
+  std::chrono::high_resolution_clock::time_point tpd =
+      std::chrono::high_resolution_clock::now();
+  LOG_CERR(
+      "finish meta feedback trans, start to do gc. send install info time:: ",
+      std::chrono::duration_cast<std::chrono::microseconds>(tpd - tpc).count());
+  for (size_t i = 0; i < tmp_memtables_.size(); i++)
+    free(reinterpret_cast<char*>(tmp_memtables_[i]));
+  for (size_t i = 0; i < tmp_memreps_.size(); i++) {
+    auto it = tmp_memreps_[i];
+    delete it->memtable;
+    delete it->arena;
+    delete it->key_cmp;
+    delete it->prefix_extractor;
+    rdma_client->rdma_mem_.free(it->index);
+    rdma_client->rdma_mem_.free(it->meta);
+    for (auto& data : it->data) {
+      rdma_client->rdma_mem_.free(data.first);
+    }
+    delete it;
+  }
+  tmp_memreps_.clear();
+  tmp_memtables_.clear();
+
+  free(local_handler);
+  bg_flush_scheduled_--;
+  bg_cv_.SignalAll();
+  TEST_SYNC_POINT("DBImpl::BackgroundCallRemoteFlush:Finish");
+}
+
+void DBImpl::UnscheduleRemoteFlushCallback(void*) {
+  LOG("DBImpl::UnscheduleRemoteFlushCallback");
+}
+
+void DBImpl::BGWorkRemoteFlush(void* arg) {
+  RemoteFlushThreadArg fta = *(reinterpret_cast<RemoteFlushThreadArg*>(arg));
+  delete reinterpret_cast<RemoteFlushThreadArg*>(arg);
+
+  IOSTATS_SET_THREAD_POOL_ID(fta.thread_pri_);
+  TEST_SYNC_POINT("DBImpl::BGWorkRemoteFlush:Start");
+  LOG("Remote flush job started: ", fta.sockfd_);
+  static_cast_with_check<DBImpl>(fta.db_)->BackgroundCallRemoteFlush(
+      fta.sockfd_,
+#ifdef ROCKSDB_RDMA
+      fta.rdma_client_, fta.rdma_conn_, fta.remote_seg_, fta.rdma_conn_ret_,
+#endif  // ROCKSDB_RDMA
+      fta.thread_pri_);
+  LOG("Remote flush job finished: ", fta.sockfd_);
+  TEST_SYNC_POINT("DBImpl::BGWorkRemoteFlush:Finish");
+}
+
+Status DBImpl::ListenAndScheduleFlushJob(int port) {
+  mutex_.Lock();
+  if (!opened_successfully_ || bg_work_paused_ > 0 ||
+      (error_handler_.IsBGWorkStopped() &&
+       !error_handler_.IsRecoveryInProgress()) ||
+      shutting_down_.load(std::memory_order_acquire)) {
+    mutex_.Unlock();
+    return Status::Aborted("DB is not working");
+  }
+  mutex_.Unlock();
+
+  auto *worker_node = new RDMAClient(), *listen_node = new RDMAClient();
+  worker_node->resources_create(1ull << 34);  // 16GB
+  worker_node->rdma_mem_.init(worker_node->buf_size);
+  listen_node->resources_create(1ull << 20);
+  listen_node->rdma_mem_.init(listen_node->buf_size);
+  std::vector<std::thread*> threads;
+  for (auto& i : memnodes_ip_port_) {
+    auto wait_for_jobs = [this, worker_node, listen_node, &i] {
+      int poll_ = 0;
+      std::atomic<RDMANode::rdma_connection*> worker_conn[32];
+      for (auto& j : worker_conn) {
+        j = worker_node->sock_connect(i.first, i.second);
+      }
+      auto listen_conn = listen_node->sock_connect(i.first, i.second);
+      listen_node->register_executor_request(listen_conn);
+      while (true) {
+        auto remote_seg = listen_node->wait_for_job_request(listen_conn);
+        // choose worker_node
+        bool found = false;
+        RDMANode::rdma_connection* chose = nullptr;
+        auto* fta = new RemoteFlushThreadArg();
+        while (!found) {
+          chose = worker_conn[poll_].exchange(nullptr);
+          if (chose != nullptr) {
+            found = true;
+            fta->rdma_conn_ret_ = &worker_conn[poll_];
+            fta->remote_seg_ = remote_seg;
+            fta->rdma_conn_ = chose;
+            fta->rdma_client_ = worker_node;
+          }
+          poll_ = (poll_ + 1) % 32;
+        }
+
+        mutex_.Lock();
+        Status s = Status::OK();
+        auto bg_job_limits = GetBGJobLimits();
+        bool is_flush_pool_empty =
+            env_->GetBackgroundThreads(Env::Priority::HIGH) == 0;
+        if (!is_flush_pool_empty &&
+            bg_flush_scheduled_ < bg_job_limits.max_flushes) {
+          bg_flush_scheduled_++;
+          fta->thread_pri_ = Env::Priority::HIGH;
+          fta->db_ = this;
+          env_->Schedule(&DBImpl::BGWorkRemoteFlush, fta, Env::Priority::HIGH,
+                         this, &DBImpl::UnscheduleRemoteFlushCallback);
+        } else {
+          LOG("worker pool is full:", is_flush_pool_empty, " ",
+              unscheduled_flushes_, " ", bg_flush_scheduled_, " ",
+              bg_job_limits.max_flushes);
+        }
+        mutex_.Unlock();
+      }
+    };
+    threads.push_back(new std::thread(wait_for_jobs));
+  }
+  for (auto& thread : threads) thread->join();
+
+  return Status::OK();
 }
 
 Status DBImpl::Resume() {
@@ -615,7 +908,6 @@ Status DBImpl::CloseHelper() {
     }
     mutex_.Lock();
   }
-
   // Clean up obsolete files due to SuperVersion release.
   // (1) Need to delete to obsolete files before closing because RepairDB()
   // scans all existing files in the file system and builds manifest file.
@@ -679,7 +971,6 @@ Status DBImpl::CloseHelper() {
   for (auto& txn_entry : recovered_transactions_) {
     delete txn_entry.second;
   }
-
   // versions need to be destroyed before table_cache since it can hold
   // references to table_cache.
   versions_.reset();
@@ -707,11 +998,9 @@ Status DBImpl::CloseHelper() {
       ret = s;
     }
   }
-
   if (write_buffer_manager_ && wbm_stall_) {
     write_buffer_manager_->RemoveDBFromQueue(wbm_stall_.get());
   }
-
   IOStatus io_s = directories_.Close(IOOptions(), nullptr /* dbg */);
   if (!io_s.ok()) {
     ret = io_s;
@@ -722,7 +1011,7 @@ Status DBImpl::CloseHelper() {
     // retry. In this case, we wrap this exception to something else.
     return Status::Incomplete(ret.ToString());
   }
-
+  LOG("CloseHelper finish");
   return ret;
 }
 
@@ -742,6 +1031,11 @@ DBImpl::~DBImpl() {
   {
     const Status s = MaybeReleaseTimestampedSnapshotsAndCheck();
     s.PermitUncheckedError();
+  }
+
+  {
+    delete rdma_client_;
+    rdma_client_ = nullptr;
   }
 
   closing_status_ = CloseImpl();
@@ -777,7 +1071,6 @@ void DBImpl::PrintStatistics() {
 }
 
 Status DBImpl::StartPeriodicTaskScheduler() {
-
 #ifndef NDEBUG
   // It only used by test to disable scheduler
   bool disable_scheduler = false;
@@ -2120,14 +2413,14 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
 
         RecordTick(stats_, MEMTABLE_HIT);
       } else if ((s.ok() || s.IsMergeInProgress()) &&
-                 sv->imm->Get(lkey,
-                              get_impl_options.value
-                                  ? get_impl_options.value->GetSelf()
-                                  : nullptr,
-                              get_impl_options.columns, timestamp, &s,
-                              &merge_context, &max_covering_tombstone_seq,
-                              read_options, get_impl_options.callback,
-                              get_impl_options.is_blob_index)) {
+                 sv->imm->Get(
+                     lkey,
+                     get_impl_options.value ? get_impl_options.value->GetSelf()
+                                            : nullptr,
+                     get_impl_options.columns, timestamp, &s, &merge_context,
+                     &max_covering_tombstone_seq, read_options,
+                     get_impl_options.callback, get_impl_options.is_blob_index,
+                     cfd->get_cflevel_read_client(), cfd->GetID(), cfd)) {
         done = true;
 
         if (get_impl_options.value) {
@@ -3840,7 +4133,6 @@ Status DBImpl::GetPropertiesOfTablesInRange(ColumnFamilyHandle* column_family,
   return s;
 }
 
-
 const std::string& DBImpl::GetName() const { return dbname_; }
 
 Env* DBImpl::GetEnv() const { return env_; }
@@ -3858,7 +4150,6 @@ SystemClock* DBImpl::GetSystemClock() const {
   return immutable_db_options_.clock;
 }
 
-
 Status DBImpl::StartIOTrace(const TraceOptions& trace_options,
                             std::unique_ptr<TraceWriter>&& trace_writer) {
   assert(trace_writer != nullptr);
@@ -3870,7 +4161,6 @@ Status DBImpl::EndIOTrace() {
   io_tracer_->EndIOTrace();
   return Status::OK();
 }
-
 
 Options DBImpl::GetOptions(ColumnFamilyHandle* column_family) const {
   InstrumentedMutexLock l(&mutex_);
@@ -4393,6 +4683,7 @@ Status DBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
       }
     }
     if (edit.GetDeletedFiles().empty()) {
+      LOG("traccking test");
       job_context.Clean();
       return status;
     }
@@ -4463,7 +4754,6 @@ void DBImpl::GetAllColumnFamilyMetaData(
     }
   }
 }
-
 
 Status DBImpl::CheckConsistency() {
   mutex_.AssertHeld();
@@ -4644,6 +4934,14 @@ Status DBImpl::Close() {
   InstrumentedMutexLock closing_lock_guard(&closing_mutex_);
   if (closed_) {
     return closing_status_;
+  }
+  {
+    if (pd_connection_client_ != nullptr) {
+      std::lock_guard<std::mutex> lck(pd_connection_client_->get_mutex());
+      pd_connection_client_->set_get_placement_info(
+          []() { return placement_info{}; });
+    }
+    pd_connection_client_ = nullptr;
   }
 
   {

@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors
 
+#include "rocksdb/env.h"
 #if !defined(OS_WIN)
 
 #include <dirent.h>
@@ -341,7 +342,7 @@ class PosixFileSystem : public FileSystem {
 #endif
       result->reset(new PosixWritableFile(
           fname, fd, GetLogicalBlockSizeForWriteIfNeeded(options, fname, fd),
-          options));
+          options, &writeWindow_));
     } else {
       // disable mmap writes
       EnvOptions no_mmap_writes_options = options;
@@ -350,7 +351,7 @@ class PosixFileSystem : public FileSystem {
           new PosixWritableFile(fname, fd,
                                 GetLogicalBlockSizeForWriteIfNeeded(
                                     no_mmap_writes_options, fname, fd),
-                                no_mmap_writes_options));
+                                no_mmap_writes_options, &writeWindow_));
     }
     return s;
   }
@@ -436,7 +437,7 @@ class PosixFileSystem : public FileSystem {
 #endif
       result->reset(new PosixWritableFile(
           fname, fd, GetLogicalBlockSizeForWriteIfNeeded(options, fname, fd),
-          options));
+          options, &writeWindow_));
     } else {
       // disable mmap writes
       FileOptions no_mmap_writes_options = options;
@@ -445,7 +446,7 @@ class PosixFileSystem : public FileSystem {
           new PosixWritableFile(fname, fd,
                                 GetLogicalBlockSizeForWriteIfNeeded(
                                     no_mmap_writes_options, fname, fd),
-                                no_mmap_writes_options));
+                                no_mmap_writes_options, &writeWindow_));
     }
     return s;
   }
@@ -938,6 +939,20 @@ class PosixFileSystem : public FileSystem {
     return Status::OK();
   }
 #endif
+
+  virtual int get_writein_speed() override {
+    return writeWindow_.get(
+        std::chrono::time_point<std::chrono::system_clock>::clock::now());
+  }
+
+ private:
+  FileSystem::SlidingWindow writeWindow_;
+
+ public:
+  FileSystem::SlidingWindow* get_sliding_window() override {
+    return &writeWindow_;
+  }
+
  private:
   bool forceMmapOff_ = false;  // do we override Env options?
 

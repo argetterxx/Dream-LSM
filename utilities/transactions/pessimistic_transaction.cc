@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/transactions/pessimistic_transaction.h"
 
 #include <map>
@@ -1170,4 +1169,3 @@ Status PessimisticTransaction::SetName(const TransactionName& name) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

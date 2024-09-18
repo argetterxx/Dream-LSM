@@ -165,7 +165,6 @@ size_t TailPrefetchStats::GetSuggestedPrefetchSize() {
   return std::min(kMaxPrefetchSize, max_qualified_size);
 }
 
-
 const std::string kOptNameMetadataCacheOpts = "metadata_cache_options";
 
 static std::unordered_map<std::string, PinningTier>
@@ -224,7 +223,6 @@ static std::unordered_map<std::string,
         {"kDisable", BlockBasedTableOptions::PrepopulateBlockCache::kDisable},
         {"kFlushOnly",
          BlockBasedTableOptions::PrepopulateBlockCache::kFlushOnly}};
-
 
 static std::unordered_map<std::string, OptionTypeInfo>
     block_based_table_type_info = {
@@ -496,8 +494,8 @@ namespace {
 // Different cache kinds use the same keys for physically different values, so
 // they must not share an underlying key space with each other.
 Status CheckCacheOptionCompatibility(const BlockBasedTableOptions& bbto) {
-  int cache_count = (bbto.block_cache != nullptr) +
-                    (bbto.persistent_cache != nullptr);
+  int cache_count =
+      (bbto.block_cache != nullptr) + (bbto.persistent_cache != nullptr);
   if (cache_count <= 1) {
     // Nothing to share / overlap
     return Status::OK();
@@ -584,6 +582,7 @@ Status BlockBasedTableFactory::NewTableReader(
 TableBuilder* BlockBasedTableFactory::NewTableBuilder(
     const TableBuilderOptions& table_builder_options,
     WritableFileWriter* file) const {
+  LOG("BlockBasedTableFactory::NewTableBuilder");
   return new BlockBasedTableBuilder(table_options_, table_builder_options,
                                     file);
 }

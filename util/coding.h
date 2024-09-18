@@ -23,6 +23,8 @@
 #include "rocksdb/slice.h"
 #include "util/coding_lean.h"
 
+#include <iostream>
+
 // Some processors does not allow unaligned access to memory
 #if defined(__sparc)
 #define PLATFORM_UNALIGNED_ACCESS_NOT_ALLOWED
@@ -336,6 +338,7 @@ inline Slice GetLengthPrefixedSlice(const char* data) {
   // +5: we assume "data" is not corrupted
   // unsigned char is 7 bits, uint32_t is 32 bits, need 5 unsigned char
   auto p = GetVarint32Ptr(data, data + 5 /* limit */, &len);
+  // std::cout << "p: " << p << ", " << "p addr: " << static_cast<const void*>(p) << ", " << "p len: " << len << ". " << std::endl;
   return Slice(p, len);
 }
 

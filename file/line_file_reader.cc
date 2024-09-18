@@ -5,6 +5,7 @@
 
 #include "file/line_file_reader.h"
 
+#include <cassert>
 #include <cstring>
 
 #include "monitoring/iostats_context_imp.h"
@@ -68,6 +69,36 @@ bool LineFileReader::ReadLine(std::string* out,
     buf_begin_ = result.data();
     buf_end_ = result.data() + result.size();
   }
+}
+
+bool LineMemReader::ReadLine(std::string* out) {
+  assert(out);
+  if (!io_status_.ok()) {
+    // Status should be checked (or permit unchecked) any time we return false.
+    io_status_.MustCheck();
+    return false;
+  }
+  out->clear();
+  for (;;) {
+    // Look for line delimiter
+    const char* found = static_cast<const char*>(std::memchr(
+        buf_begin_, '\n', data_.data() + data_.size() - buf_begin_));
+    if (found) {
+      size_t len = found - buf_begin_;
+      out->append(buf_begin_, len);
+      buf_begin_ += len + /*delim*/ 1;
+      ++line_number_;
+      return true;
+    }
+    if (at_eof_) {
+      io_status_.MustCheck();
+      return false;
+    }
+    // else flush and reload buffer
+    out->append(buf_begin_, data_.data() + data_.size() - buf_begin_);
+    at_eof_ = true;
+  }
+  return true;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

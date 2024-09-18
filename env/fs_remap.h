@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <utility>
 
 #include "rocksdb/file_system.h"
@@ -134,4 +133,3 @@ class RemapFileSystem : public FileSystemWrapper {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

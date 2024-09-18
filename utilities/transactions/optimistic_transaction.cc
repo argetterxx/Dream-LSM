@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/transactions/optimistic_transaction.h"
 
 #include <string>
@@ -191,4 +190,3 @@ Status OptimisticTransaction::SetName(const TransactionName& /* unused */) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

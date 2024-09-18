@@ -9,15 +9,19 @@
 
 #pragma once
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 #include "db/dbformat.h"
 #include "db/kv_checksum.h"
+#include "db/lookup_key.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/read_callback.h"
 #include "db/version_edit.h"
@@ -25,8 +29,14 @@
 #include "memory/concurrent_arena.h"
 #include "monitoring/instrumented_mutex.h"
 #include "options/cf_options.h"
+#include "rocksdb/compression_type.h"
 #include "rocksdb/db.h"
+#include "rocksdb/listener.h"
 #include "rocksdb/memtablerep.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
+#include "rocksdb/table_properties.h"
+#include "rocksdb/types.h"
 #include "table/multiget_context.h"
 #include "util/dynamic_bloom.h"
 #include "util/hash.h"
@@ -41,6 +51,18 @@ class MergeContext;
 class SystemClock;
 
 struct ImmutableMemTableOptions {
+ public:
+  void PackLocal(TransferService* node) const {
+    node->send(reinterpret_cast<const void*>(this), sizeof(*this));
+  }
+  static void* UnPackLocal(TransferService* node) {
+    void* mem = malloc(sizeof(ImmutableMemTableOptions));
+    node->receive(&mem, sizeof(ImmutableMemTableOptions));
+    auto* ptr = reinterpret_cast<ImmutableMemTableOptions*>(mem);
+    ptr->info_log = nullptr;
+    return mem;
+  }
+
   explicit ImmutableMemTableOptions(const ImmutableOptions& ioptions,
                                     const MutableCFOptions& mutable_cf_options);
   size_t arena_block_size;
@@ -86,7 +108,74 @@ using MultiGetRange = MultiGetContext::Range;
 // written to (aka the 'immutable memtables').
 class MemTable {
  public:
+  inline std::pair<RDMAClient*, RDMANode::rdma_connection*> get_conn() const {
+    return conn_;
+  }
+  inline void set_remote_begin(void* remote) {
+    table_->set_remote_begin(remote);
+  }
+  inline void set_local_begin(void* local) { table_->set_local_begin(local); }
+  inline void set_shard_local_begin(int sep, void* local) {
+    table_->set_shard_local_begin(sep, local);
+  }
+  inline void set_shard_remote_begin(int sep, void* remote) {
+    table_->set_shard_remote_begin(sep, remote);
+  }
+  inline std::pair<void*, size_t> get_shard_local_begin(int sep) {
+    return table_->get_shard_local_begin(sep);
+  }
+  inline std::pair<void*, size_t> get_shard_remote_begin(int sep) {
+    return table_->get_shard_remote_begin(sep);
+  }
+  inline int32_t get_head_offset() { return table_->get_head_offset(); }
+  inline void set_max_height(int height) { table_->set_max_height(height); }
+  inline void get_max_height(int& height) { table_->get_max_height(height); }
+  inline std::pair<const char*, size_t> local_begin() const {
+    return table_->local_begin();
+  }
+  inline std::pair<void*, size_t> remote_begin() const {
+    return table_->remote_begin();
+  }
+  Status SendToRemote(RDMAClient* client,
+                      RDMANode::rdma_connection* memtable_conn,
+                      const size_t local_index_offset,
+                      const std::pair<size_t, size_t>& remote_index_reg,
+                      const std::pair<std::string, size_t> memnode_ip_port,
+                      uint64_t cfd_id,
+                      std::queue<std::pair<uint64_t, uint64_t>>* gc_queue,
+                      bool need_mark);
+  Status RemoteRead();
+  void free_remote() {
+    flush_job_info_.reset();
+    delete arena_;
+    delete prefix_extractor_;
+    delete table_;
+    delete range_del_table_;
+  }
+  static void* UnPackLocal(TransferService* node, MemTableRep* rep);
+  void PackLocal(TransferService* node, uint64_t mixed_id) const;
+  void PackRemote(TransferService* node) const;
+  void UnPackRemote(TransferService* node);
+  void DoubleCheck(TransferService* node, MemTableRep* rep);
+
+ public:
   struct KeyComparator : public MemTableRep::KeyComparator {
+   public:
+    void PackLocal(TransferService* node) const override {
+      LOG("KeyComparator::PackLocal");
+      comparator.PackLocal(node);
+    }
+    static void* UnPackLocal(TransferService* node) {
+      LOG("KeyComparator::UnPackLocal");
+      void* internal_key_comparator = InternalKeyComparator::UnPackLocal(node);
+      void* mem = new KeyComparator(InternalKeyComparator());
+      auto* kcmp = reinterpret_cast<KeyComparator*>(mem);
+      memcpy(reinterpret_cast<void*>(
+                 const_cast<InternalKeyComparator*>(&kcmp->comparator)),
+             internal_key_comparator, sizeof(InternalKeyComparator));
+      return mem;
+    }
+
     const InternalKeyComparator comparator;
     explicit KeyComparator(const InternalKeyComparator& c) : comparator(c) {}
     virtual int operator()(const char* prefix_len_key1,
@@ -108,7 +197,10 @@ class MemTable {
                     const ImmutableOptions& ioptions,
                     const MutableCFOptions& mutable_cf_options,
                     WriteBufferManager* write_buffer_manager,
-                    SequenceNumber earliest_seq, uint32_t column_family_id);
+                    SequenceNumber earliest_seq, uint32_t column_family_id,
+                    RDMAClient* = nullptr,
+                    RDMANode::rdma_connection* = nullptr);
+
   // No copying allowed
   MemTable(const MemTable&) = delete;
   MemTable& operator=(const MemTable&) = delete;
@@ -151,7 +243,7 @@ class MemTable {
   size_t MemoryAllocatedBytes() const {
     return table_->ApproximateMemoryUsage() +
            range_del_table_->ApproximateMemoryUsage() +
-           arena_.MemoryAllocatedBytes();
+           arena_->MemoryAllocatedBytes();
   }
 
   // Returns a vector of unique random memtable entries of size 'sample_size'.
@@ -201,7 +293,8 @@ class MemTable {
   // arena: If not null, the arena needs to be used to allocate the Iterator.
   //        Calling ~Iterator of the iterator will destroy all the states but
   //        those allocated in arena.
-  InternalIterator* NewIterator(const ReadOptions& read_options, Arena* arena);
+  InternalIterator* NewIterator(const ReadOptions& read_options, Arena* arena,
+                                int sep = -1);
 
   // Returns an iterator that yields the range tombstones of the memtable.
   // The caller must ensure that the underlying MemTable remains live
@@ -265,7 +358,8 @@ class MemTable {
            SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
            const ReadOptions& read_opts, bool immutable_memtable,
            ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
-           bool do_merge = true);
+           bool do_merge = true, RDMAReadClient* read_client = nullptr,
+           RDMANode::rdma_connection* conn = nullptr, uint64_t cfd_id = 0);
 
   bool Get(const LookupKey& key, std::string* value,
            PinnableWideColumns* columns, std::string* timestamp, Status* s,
@@ -273,11 +367,36 @@ class MemTable {
            SequenceNumber* max_covering_tombstone_seq,
            const ReadOptions& read_opts, bool immutable_memtable,
            ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
-           bool do_merge = true) {
+           bool do_merge = true, RDMAReadClient* read_client = nullptr,
+           RDMANode::rdma_connection* conn = nullptr, uint64_t cfd_id = 0) {
     SequenceNumber seq;
     return Get(key, value, columns, timestamp, s, merge_context,
                max_covering_tombstone_seq, &seq, read_opts, immutable_memtable,
-               callback, is_blob_index, do_merge);
+               callback, is_blob_index, do_merge, read_client, conn, cfd_id);
+  }
+
+  bool PrevGet(const LookupKey& key, std::string* value,
+               PinnableWideColumns* columns, std::string* timestamp, Status* s,
+               MergeContext* merge_context,
+               SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
+               const ReadOptions& read_opts, bool immutable_memtable,
+               ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
+               bool do_merge = true, RDMAReadClient* read_client = nullptr,
+               RDMANode::rdma_connection* conn = nullptr, uint64_t cfd_id = 0);
+
+  bool PrevGet(const LookupKey& key, std::string* value,
+               PinnableWideColumns* columns, std::string* timestamp, Status* s,
+               MergeContext* merge_context,
+               SequenceNumber* max_covering_tombstone_seq,
+               const ReadOptions& read_opts, bool immutable_memtable,
+               ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
+               bool do_merge = true, RDMAReadClient* read_client = nullptr,
+               RDMANode::rdma_connection* conn = nullptr, uint64_t cfd_id = 0) {
+    SequenceNumber seq;
+    return PrevGet(key, value, columns, timestamp, s, merge_context,
+                   max_covering_tombstone_seq, &seq, read_opts,
+                   immutable_memtable, callback, is_blob_index, do_merge,
+                   read_client, conn, cfd_id);
   }
 
   // @param immutable_memtable Whether this memtable is immutable. Used
@@ -489,6 +608,9 @@ class MemTable {
 
   uint64_t GetID() const { return id_; }
 
+  bool IsTransferCompleted() const { return table_->IsRemote(); }
+  bool IsTransferCalled() const { return table_->IsRemoteCalled(); }
+
   void SetFlushCompleted(bool completed) { flush_completed_ = completed; }
 
   uint64_t GetFileNumber() const { return file_number_; }
@@ -532,6 +654,19 @@ class MemTable {
                                     size_t protection_bytes_per_key,
                                     bool allow_data_in_errors = false);
 
+  inline void TESTContinuous() {
+    LOG_CERR("MemTable TESTContinuous");
+    // void* head = reinterpret_cast<void*>(this);
+    // LOG_CERR(table_->ApproximateMemoryUsage(), ' ',
+    //          range_del_table_->ApproximateMemoryUsage(), ' ',
+    //          arena_->ApproximateMemoryUsage(), ' ',
+    //          arena_->MemoryAllocatedBytes());
+    // table_->TESTContinuous();
+    // range_del_table_->TESTContinuous();
+    // arena_->TESTContinuous();
+    LOG_CERR("Memtable TESTContinuous finish");
+  }
+
  private:
   enum FlushStateEnum { FLUSH_NOT_REQUESTED, FLUSH_REQUESTED, FLUSH_SCHEDULED };
 
@@ -544,9 +679,9 @@ class MemTable {
   int refs_;
   const size_t kArenaBlockSize;
   AllocTracker mem_tracker_;
-  ConcurrentArena arena_;
-  std::unique_ptr<MemTableRep> table_;
-  std::unique_ptr<MemTableRep> range_del_table_;
+  BasicArena* arena_;
+  MemTableRep* table_;
+  MemTableRep* range_del_table_;
   std::atomic_bool is_range_del_table_empty_;
 
   // Total data size of all data inserted
@@ -603,6 +738,9 @@ class MemTable {
 
   // Memtable id to track flush.
   uint64_t id_ = 0;
+  uint64_t mixed_id_ = 0;
+  std::queue<std::pair<uint64_t, uint64_t>>* gc_queue_ = nullptr;
+  std::pair<RDMAClient*, RDMANode::rdma_connection*> conn_ = {nullptr, nullptr};
 
   // Sequence number of the atomic flush that is responsible for this memtable.
   // The sequence number of atomic flush is a seq, such that no writes with

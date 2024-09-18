@@ -503,4 +503,3 @@ class TransactionDB : public StackableDB {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

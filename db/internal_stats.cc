@@ -33,7 +33,6 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-
 const std::map<LevelStatType, LevelStat> InternalStats::compaction_level_stats =
     {
         {LevelStatType::NUM_FILES, LevelStat{"NumFiles", "Files"}},
@@ -2086,6 +2085,5 @@ void InternalStats::DumpCFFileHistogram(std::string* value) {
 
   value->append(oss.str());
 }
-
 
 }  // namespace ROCKSDB_NAMESPACE

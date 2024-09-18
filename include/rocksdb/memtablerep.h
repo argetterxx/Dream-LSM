@@ -38,13 +38,21 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <unordered_set>
 
+#include "db/dbformat.h"
 #include "rocksdb/customizable.h"
+#include "rocksdb/logger.hpp"
+#include "rocksdb/macro.hpp"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/slice.h"
-
+#include "rocksdb/status.h"
 namespace ROCKSDB_NAMESPACE {
 
 class Arena;
@@ -57,12 +65,78 @@ struct DBOptions;
 using KeyHandle = void*;
 
 extern Slice GetLengthPrefixedSlice(const char* data);
-
+extern int VarintLength(uint64_t v);
 class MemTableRep {
+ public:
+  virtual bool IsRemote() const { assert(false); }
+  virtual bool IsRemoteCalled() const { assert(false); }
+  virtual void* get_allocator() const { assert(false); }
+  virtual void* get_prefix_extractor() const { assert(false); }
+  virtual void* get_comparator() const { assert(false); }
+  virtual void set_remote_begin(void*) {
+    LOG("MemTableRep::set_local_begin: error: not implemented");
+    assert(false);
+  }
+  virtual void set_local_begin(void*) /*only use this at remote side*/ {
+    LOG("MemTableRep::set_local_begin: error: not implemented");
+    assert(false);
+  }
+  virtual void set_head_offset(int64_t offset) {
+    LOG("MemTableRep::set_head_offset: error: not implemented");
+    assert(false);
+  }
+  virtual int64_t get_head_offset() const {
+    LOG("MemTableRep::get_head_offset: error: not implemented");
+    assert(false);
+  }
+  virtual void set_shard_remote_begin(int, void*) { assert(false); }
+  virtual std::pair<void*, size_t> get_shard_remote_begin(int) {
+    assert(false);
+  }
+  virtual void set_shard_local_begin(int, void*) { assert(false); }
+  virtual std::pair<void*, size_t> get_shard_local_begin(int) { assert(false); }
+  virtual void set_max_height(int height) { assert(false); }
+  virtual void get_max_height(int& height) const { assert(false); }
+  virtual std::pair<const char*, size_t> local_begin() const {
+    LOG("MemTableRep::get_remote_begin: error: not implemented");
+    assert(false);
+    return std::make_pair(nullptr, 0);
+  }
+  virtual std::pair<void*, size_t> remote_begin() const {
+    assert(false);
+    return std::make_pair(nullptr, 0);
+  }
+  virtual Status MemnodeRebuild() {
+    LOG("MemTableRep::MemnodeRebuild: error: not implemented");
+    assert(false);
+  }
+  virtual Status SendToRemote(RDMAClient*, RDMANode::rdma_connection*,
+                              const std::pair<size_t, size_t>&, size_t,
+                              uint64_t, int) {
+    LOG("MemTableRep::SendToRemote: error: not implemented");
+    assert(false);
+  }
+  virtual void TESTContinuous() const {
+    LOG("MemTableRep::TESTContinuous");
+    assert(false);
+    LOG("MemTableRep::TESTContinuous finish");
+  }
+  virtual void PackLocal(TransferService*,
+                         size_t protection_bytes_per_key) const {
+    LOG("MemTableRep::PackLocal: error: not implemented");
+    assert(false);
+  }
+
  public:
   // KeyComparator provides a means to compare keys, which are internal keys
   // concatenated with values.
   class KeyComparator {
+   public:
+    virtual void PackLocal(TransferService*) const {
+      LOG("MemTableRep::KeyComparator::PackLocal: error: not implemented");
+      assert(false);
+    }
+
    public:
     using DecodedType = ROCKSDB_NAMESPACE::Slice;
 
@@ -72,6 +146,20 @@ class MemTableRep {
       return GetLengthPrefixedSlice(key);
     }
 
+    virtual size_t decode_len(const char* key,
+                              size_t protection_bytes_per_key) const {
+      // format: MemTable::Add
+      size_t ret = 0;
+      char* buf = const_cast<char*>(key);
+      Slice ikey = GetLengthPrefixedSlice(key);
+      uint32_t ikey_len = ikey.size();
+      ret += ikey_len + VarintLength(ikey_len);
+      buf += ret;
+      Slice value = GetLengthPrefixedSlice(buf);
+      uint32_t value_len = value.size();
+      ret += value_len + VarintLength(value_len);
+      return ret + protection_bytes_per_key;
+    }
     // Compare a and b. Return a negative value if a is less than b, 0 if they
     // are equal, and a positive value if a is greater than b
     virtual int operator()(const char* prefix_len_key1,
@@ -90,7 +178,9 @@ class MemTableRep {
   // better. By allowing it to allocate memory, it can possibly put
   // correlated stuff in consecutive memory area to make processor
   // prefetching more efficient.
-  virtual KeyHandle Allocate(const size_t len, char** buf);
+  virtual KeyHandle Allocate(const size_t len, char** buf,
+                             char** kv_buf = nullptr,
+                             const char* prefix = nullptr);
 
   // Insert key into the collection. (The caller will pack key and value into a
   // single buffer and pass that in as the parameter to Insert).
@@ -169,14 +259,15 @@ class MemTableRep {
   // does nothing.  After MarkReadOnly() is called, this table rep will
   // not be written to (ie No more calls to Allocate(), Insert(),
   // or any writes done directly to entries accessed through the iterator.)
-  virtual void MarkReadOnly() {}
+  virtual void MarkReadOnly() { LOG_CERR("MemTableRep MarkReadOnly"); }
+  virtual void MarkTransAsFinished() { assert(false); }
 
   // Notify this table rep that it has been flushed to stable storage.
   // By default, does nothing.
   //
   // Invariant: MarkReadOnly() is called, before MarkFlushed().
-  // Note that this method if overridden, should not run for an extended period
-  // of time. Otherwise, RocksDB may be blocked.
+  // Note that this method if overridden, should not run for an extended
+  // period of time. Otherwise, RocksDB may be blocked.
   virtual void MarkFlushed() {}
 
   // Look up key from the mem table, since the first key in the mem table whose
@@ -191,6 +282,10 @@ class MemTableRep {
   // Default:
   // Get() function with a default value of dynamically construct an iterator,
   // seek and call the call back function.
+  virtual void RGet(const InternalKeyComparator* cmp, void* req_data,
+                    void* ret_data, void* rdma_buf);
+  virtual void RGet_v2(const InternalKeyComparator* cmp, void* req_data,
+                       void* ret_data, void* rdma_buf);
   virtual void Get(const LookupKey& k, void* callback_args,
                    bool (*callback_func)(void* arg, const char* entry));
 
@@ -210,9 +305,13 @@ class MemTableRep {
     assert(false);
   }
 
-  // Report an approximation of how much memory has been used other than memory
-  // that was allocated through the allocator.  Safe to call from any thread.
-  virtual size_t ApproximateMemoryUsage() = 0;
+  // Report an approximation of how much memory has been used other than
+  // memory that was allocated through the allocator.  Safe to call from any
+  // thread.
+  virtual size_t ApproximateMemoryUsage() {
+    LOG("should not call this");
+    return 0;
+  }
 
   virtual ~MemTableRep() {}
 
@@ -260,16 +359,19 @@ class MemTableRep {
   // Return an iterator over the keys in this representation.
   // arena: If not null, the arena needs to be used to allocate the Iterator.
   //        When destroying the iterator, the caller will not call "delete"
-  //        but Iterator::~Iterator() directly. The destructor needs to destroy
-  //        all the states but those allocated in arena.
+  //        but Iterator::~Iterator() directly. The destructor needs to
+  //        destroy all the states but those allocated in arena.
   virtual Iterator* GetIterator(Arena* arena = nullptr) = 0;
+  virtual Iterator* GetSepIterator(Arena* arena = nullptr, int sep = -1) {
+    assert(false);
+  }
 
   // Return an iterator that has a special Seek semantics. The result of
   // a Seek might only include keys with the same prefix as the target key.
   // arena: If not null, the arena is used to allocate the Iterator.
   //        When destroying the iterator, the caller will not call "delete"
-  //        but Iterator::~Iterator() directly. The destructor needs to destroy
-  //        all the states but those allocated in arena.
+  //        but Iterator::~Iterator() directly. The destructor needs to
+  //        destroy all the states but those allocated in arena.
   virtual Iterator* GetDynamicPrefixIterator(Arena* arena = nullptr) {
     return GetIterator(arena);
   }
@@ -312,6 +414,13 @@ class MemTableRepFactory : public Customizable {
       const SliceTransform* slice_transform, Logger* logger,
       uint32_t /* column_family_id */) {
     return CreateMemTableRep(key_cmp, allocator, slice_transform, logger);
+  }
+
+  virtual MemTableRep* CreateExistMemTableWrapper(const Allocator*,
+                                                  const MemTableRep*) {
+    LOG("should not call default CreateExistMemTableWrapper");
+    assert(false);
+    return nullptr;
   }
 
   const char* Name() const override = 0;
@@ -365,8 +474,8 @@ class SkipListFactory : public MemTableRepFactory {
 //
 // Parameters:
 //   count: Passed to the constructor of the underlying std::vector of each
-//     VectorRep. On initialization, the underlying array will be at least count
-//     bytes reserved for usage.
+//     VectorRep. On initialization, the underlying array will be at least
+//     count bytes reserved for usage.
 class VectorRepFactory : public MemTableRepFactory {
   size_t count_;
 
@@ -402,8 +511,8 @@ extern MemTableRepFactory* NewHashSkipListRepFactory(
 // threshold_use_skiplist.
 // @bucket_count: number of fixed array buckets
 // @huge_page_tlb_size: if <=0, allocate the hash table bytes from malloc.
-//                      Otherwise from huge page TLB. The user needs to reserve
-//                      huge pages for it to be allocated, like:
+//                      Otherwise from huge page TLB. The user needs to
+//                      reserve huge pages for it to be allocated, like:
 //                          sysctl -w vm.nr_hugepages=20
 //                      See linux doc Documentation/vm/hugetlbpage.txt
 // @bucket_entries_logging_threshold: if number of entries in one bucket

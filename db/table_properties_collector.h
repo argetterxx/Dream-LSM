@@ -6,12 +6,16 @@
 // This file defines a collection of statistics collectors.
 #pragma once
 
+#include <unistd.h>
+
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "db/dbformat.h"
 #include "rocksdb/comparator.h"
+#include "rocksdb/remote_flush_service.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/table_properties.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -40,6 +44,12 @@ class IntTblPropCollector {
 
 // Factory for internal table properties collector.
 class IntTblPropCollectorFactory {
+ public:
+  virtual void PackLocal([[maybe_unused]] TransferService* node) const {
+    LOG("IntTblPropCollectorFactory::PackLocal not implemented. Name: ",
+        Name());
+  }
+
  public:
   virtual ~IntTblPropCollectorFactory() {}
   // has to be thread-safe
@@ -89,6 +99,14 @@ class UserKeyTablePropertiesCollector : public IntTblPropCollector {
 
 class UserKeyTablePropertiesCollectorFactory
     : public IntTblPropCollectorFactory {
+ public:
+  void PackLocal(TransferService* node) const override {
+    int64_t msg = 0;
+    msg += (0x01);
+    node->send(&msg, sizeof(msg));
+    user_collector_factory_->PackLocal(node);
+  }
+
  public:
   explicit UserKeyTablePropertiesCollectorFactory(
       std::shared_ptr<TablePropertiesCollectorFactory> user_collector_factory)

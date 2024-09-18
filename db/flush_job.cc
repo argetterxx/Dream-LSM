@@ -10,13 +10,17 @@
 #include "db/flush_job.h"
 
 #include <algorithm>
+#include <cassert>
+#include <chrono>
 #include <cinttypes>
+#include <cstdint>
 #include <vector>
 
 #include "db/builder.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
 #include "db/event_helpers.h"
+#include "db/flush_job_basic.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
 #include "db/memtable.h"
@@ -36,6 +40,7 @@
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/remote_transfer_service.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
@@ -46,41 +51,9 @@
 #include "util/coding.h"
 #include "util/mutexlock.h"
 #include "util/stop_watch.h"
+#include "utilities/rf_stats.h"
 
 namespace ROCKSDB_NAMESPACE {
-
-const char* GetFlushReasonString(FlushReason flush_reason) {
-  switch (flush_reason) {
-    case FlushReason::kOthers:
-      return "Other Reasons";
-    case FlushReason::kGetLiveFiles:
-      return "Get Live Files";
-    case FlushReason::kShutDown:
-      return "Shut down";
-    case FlushReason::kExternalFileIngestion:
-      return "External File Ingestion";
-    case FlushReason::kManualCompaction:
-      return "Manual Compaction";
-    case FlushReason::kWriteBufferManager:
-      return "Write Buffer Manager";
-    case FlushReason::kWriteBufferFull:
-      return "Write Buffer Full";
-    case FlushReason::kTest:
-      return "Test";
-    case FlushReason::kDeleteFiles:
-      return "Delete Files";
-    case FlushReason::kAutoCompaction:
-      return "Auto Compaction";
-    case FlushReason::kManualFlush:
-      return "Manual Flush";
-    case FlushReason::kErrorRecovery:
-      return "Error Recovery";
-    case FlushReason::kWalFull:
-      return "WAL Full";
-    default:
-      return "Invalid";
-  }
-}
 
 FlushJob::FlushJob(
     const std::string& dbname, ColumnFamilyData* cfd,
@@ -164,6 +137,22 @@ void FlushJob::RecordFlushIOStats() {
       ThreadStatus::FLUSH_BYTES_WRITTEN, IOSTATS(bytes_written));
   IOSTATS_RESET(bytes_written);
 }
+
+void FlushJob::DoubleCheck(TransferService* node) {
+  LOG_CERR("RemoteFlushJob::DoubleCheck::versions_");
+  for (auto mem : mems_) mem->DoubleCheck(node, nullptr);
+  versions_->DoubleCheck(node);
+  LOG_CERR("RemoteFlushJob::DoubleCheck::edit_: ptr=",
+           reinterpret_cast<void*>(edit_));
+  if (edit_ != nullptr) edit_->DoubleCheck(node);
+  cfd_->DoubleCheck(node);
+  LOG_CERR("RemoteFlushJob::DoubleCheck::base_: ptr=",
+           reinterpret_cast<void*>(base_));
+  if (base_ != nullptr) base_->DoubleCheck(node);
+  LOG_CERR("RemoteFlushJob::DoubleCheck::meta_");
+  meta_.DoubleCheck(node);
+}
+
 void FlushJob::PickMemTable() {
   db_mutex_->AssertHeld();
   assert(!pick_memtable_called);
@@ -187,7 +176,6 @@ void FlushJob::PickMemTable() {
   }
 
   ReportFlushInputSize(mems_);
-
   // entries mems are (implicitly) sorted in ascending order by their created
   // time. We will use the first memtable's `edit` to keep the meta info for
   // this flush.
@@ -209,6 +197,7 @@ void FlushJob::PickMemTable() {
 
 Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
                      bool* switched_to_mempurge) {
+  uint64_t start = clock_->NowMicros();
   TEST_SYNC_POINT("FlushJob::Start");
   db_mutex_->AssertHeld();
   assert(pick_memtable_called);
@@ -280,7 +269,25 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
     s = Status::OK();
   } else {
     // This will release and re-acquire the mutex.
-    s = WriteLevel0Table();
+    LOG("before into writeLevel0table");
+    LOG(edit_->DebugString());
+    // for (int i = 0; i < 4; i++) {
+    // char* buf_ = reinterpret_cast<char*>(malloc(65535));
+    // PreTransferService pre(buf_, 65535);
+    // PostTransferService post(buf_, 65535);
+    // LOG_CERR("PreCheck");
+    // DoubleCheck(&pre);
+    // LOG_CERR("PreCheck Finsh");
+    std::thread t1([&, this] { s = WriteLevel0Table(-1); });
+    t1.join();  // Todo: fix parallization
+    // }
+    // LOG_CERR("PostCheck");
+    // DoubleCheck(&post);
+    // LOG_CERR("PostCheck Finish");
+    db_mutex_->AssertHeld();
+    LOG("after into writeLevel0table");
+    LOG(edit_->DebugString());
+    LOG("Run job: write l0table done");
   }
 
   if (s.ok() && cfd_->IsDropped()) {
@@ -296,11 +303,12 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
   } else if (write_manifest_) {
     TEST_SYNC_POINT("FlushJob::InstallResults");
     // Replace immutable memtable with the generated Table
+    uint64_t fdnum = meta_.fd.GetNumber();
     s = cfd_->imm()->TryInstallMemtableFlushResults(
         cfd_, mutable_cf_options_, mems_, prep_tracker, versions_, db_mutex_,
-        meta_.fd.GetNumber(), &job_context_->memtables_to_free, db_directory_,
+         &job_context_->memtables_to_free, db_directory_,
         log_buffer_, &committed_flush_jobs_info_,
-        !(mempurge_s.ok()) /* write_edit : true if no mempurge happened (or if aborted),
+        &fdnum,!(mempurge_s.ok()) /* write_edit : true if no mempurge happened (or if aborted),
                               but 'false' if mempurge successful: no new min log number
                               or new level 0 file path to write to manifest. */);
   }
@@ -350,7 +358,9 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
     stream << "file_cpu_read_nanos"
            << (IOSTATS(cpu_read_nanos) - prev_cpu_read_nanos);
   }
-
+  uint64_t end = clock_->NowMicros();
+  uint64_t elapsed_micros = end - start;
+  Singleton<rf_stats>::GetInstance()->ReportFlush(start, end, elapsed_micros);
   return s;
 }
 
@@ -451,10 +461,15 @@ Status FlushJob::MemPurge() {
         return s;
       }
     }
-
-    new_mem = new MemTable((cfd_->internal_comparator()), *(cfd_->ioptions()),
-                           mutable_cf_options_, cfd_->write_buffer_mgr(),
-                           earliest_seqno, cfd_->GetID());
+    if (cfd_->GetLatestCFOptions().server_use_remote_flush) {
+      LOG(" ColumnFamily ", cfd_->GetID(),
+          " Setup with remote_flush_trigger but use non-remote FlushJob");
+      assert(!cfd_->GetLatestCFOptions().server_use_remote_flush);
+    } else {
+      new_mem = new MemTable((cfd_->internal_comparator()), *(cfd_->ioptions()),
+                             mutable_cf_options_, cfd_->write_buffer_mgr(),
+                             earliest_seqno, cfd_->GetID());
+    }
     assert(new_mem != nullptr);
 
     Env* env = db_options_.env;
@@ -809,7 +824,7 @@ bool FlushJob::MemPurgeDecider(double threshold) {
           threshold);
 }
 
-Status FlushJob::WriteLevel0Table() {
+Status FlushJob::WriteLevel0Table(int sep) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_FLUSH_WRITE_L0);
   db_mutex_->AssertHeld();
@@ -857,7 +872,7 @@ Status FlushJob::WriteLevel0Table() {
           db_options_.info_log,
           "[%s] [JOB %d] Flushing memtable with next log file: %" PRIu64 "\n",
           cfd_->GetName().c_str(), job_context_->job_id, m->GetNextLogNumber());
-      memtables.push_back(m->NewIterator(ro, &arena));
+      memtables.push_back(m->NewIterator(ro, &arena, sep));
       auto* range_del_iter = m->NewRangeTombstoneIterator(
           ro, kMaxSequenceNumber, true /* immutable_memtable */);
       if (range_del_iter != nullptr) {
@@ -930,6 +945,7 @@ Status FlushJob::WriteLevel0Table() {
           meta_.fd.GetNumber());
       const SequenceNumber job_snapshot_seq =
           job_context_->GetJobSnapshotSequence();
+      LOG("FlushJob::WriteLevel0Table: BuildTable");
       s = BuildTable(
           dbname_, versions_, db_options_, tboptions, file_options_,
           cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
@@ -981,7 +997,7 @@ Status FlushJob::WriteLevel0Table() {
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
     db_mutex_->Lock();
   }
-  base_->Unref();
+  // base_->Unref();
 
   // Note that if file_size is zero, the file has been deleted and
   // should not be added to the manifest.

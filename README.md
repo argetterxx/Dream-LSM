@@ -1,31 +1,88 @@
-## RocksDB: A Persistent Key-Value Store for Flash and RAM Storage
+# **Dream-LSM**
 
-[![CircleCI Status](https://circleci.com/gh/facebook/rocksdb.svg?style=svg)](https://circleci.com/gh/facebook/rocksdb)
-[![Appveyor Build status](https://ci.appveyor.com/api/projects/status/fbgfu0so3afcno78/branch/main?svg=true)](https://ci.appveyor.com/project/Facebook/rocksdb/branch/main)
-[![PPC64le Build Status](http://140-211-168-68-openstack.osuosl.org:8080/buildStatus/icon?job=rocksdb&style=plastic)](http://140-211-168-68-openstack.osuosl.org:8080/job/rocksdb)
+## **Dependencies**
 
-RocksDB is developed and maintained by Facebook Database Engineering Team.
-It is built on earlier work on [LevelDB](https://github.com/google/leveldb) by Sanjay Ghemawat (sanjay@google.com)
-and Jeff Dean (jeff@google.com)
+- Linux - Ubuntu 18.04
+- Prepare for the dependencies of RocksDB based on this [link](https://github.com/facebook/rocksdb/blob/main/INSTALL.md)
+- Install and config HDFS server as the plugin of RocksDB
+- Install RDMA packages
 
-This code is a library that forms the core building block for a fast
-key-value server, especially suited for storing data on flash drives.
-It has a Log-Structured-Merge-Database (LSM) design with flexible tradeoffs
-between Write-Amplification-Factor (WAF), Read-Amplification-Factor (RAF)
-and Space-Amplification-Factor (SAF). It has multi-threaded compactions,
-making it especially suitable for storing multiple terabytes of data in a
-single database.
+## Deployment
+### **Dream-LSM**
+- Notice that multiple clients should bind with one server.
 
-Start with example usage here: https://github.com/facebook/rocksdb/tree/main/examples
+- **DM management**:
 
-See the [github wiki](https://github.com/facebook/rocksdb/wiki) for more explanation.
+  1. Config your HDFS cluster:
+  In the env_posix.cc, line 427:
+  `Status s = NewHdfsFileSystem("hdfs://hdfs-master:9000/", &fs);`
+  Change this based on your hdfs cluster address.
 
-The public interface is in `include/`.  Callers should not include or
-rely on the details of any other header files in this package.  Those
-internal APIs may be changed without warning.
+  2. Config your server address:
+  In the column_family.cc
+  `std::string memnode_ip = "10.10.1.3";`
+  Change this based on your DM management address
 
-Questions and discussions are welcome on the [RocksDB Developers Public](https://www.facebook.com/groups/rocksdb.dev/) Facebook group and [email list](https://groups.google.com/g/rocksdb) on Google Groups.
+  3. Build and compile
 
-## License
+    ```
+    git checkout server
+    mkdir build
+    cd build
+    cmake -DCMAKE_BUILD_TYPE=Release ..
+    make rdma_server
+    ./rdma_server
+    ```
 
-RocksDB is dual-licensed under both the GPLv2 (found in the COPYING file in the root directory) and Apache 2.0 License (found in the LICENSE.Apache file in the root directory).  You may select, at your option, one of the above-listed licenses.
+- **Dream-LSM instance**
+  1. Config your HDFS cluster:
+  In the env_posix.cc, line 427:
+  `Status s = NewHdfsFileSystem("hdfs://hdfs-master:9000/", &fs);`
+  Change this based on your hdfs cluster address.
+  2. Config your server address:
+  In the column_family.cc
+  `std::string memnode_ip = "10.10.1.3";`
+  Change this based on your DM management address
+  3. Build and compile
+  
+  ```
+  git checkout client
+  mdkir build
+  cd build
+  cmake -DCMAKE_BUILD_TYPE=Release ..
+  make remote_flush_worker
+  ./remote_flush_worker [server ip][server port][local listen port]
+  ```
+
+
+## Baselines
+
+
+
+### **Disaggre-RocksDB**
+
+- Install RocksDB
+- Install and config HDFS as the plugin of RocksDB
+- Refer to this [link](https://github.com/riversand963/rocksdb-hdfs-env)
+
+### **CaaS-LSM**
+
+- CaaS-LSM is a state-of-the-art implementation for remote
+compaction on disaggregated storage.
+
+- Refer to this [link](https://github.com/asd1ej9h/CaaS-LSM)
+
+### **Nova-LSM**
+
+- Nova-LSM is an optimized LSM-tree for storage disaggregation (instead of memory disaggregation).
+
+- Refer to this [link](https://github.com/HaoyuHuang/NovaLSM)
+
+
+## Evaluation
+
+Run db_bench with Dream-LSM
+
+```
+./db_bench --num=1845000 --max_write_buffer_number=8 --disable_auto_compactions=1 --cache_index_and_filter_blocks=true --pin_l0_filter_and_index_blocks_in_cache=true --bloom_bits=10 --cache_size=536870912 --memtable_bloom_size_ratio=0.1 --memtable_whole_key_filtering=true --max_local_write_buffer_number=2 --max_background_compactions=4 --max_background_flushes=4 --level0_slowdown_writes_trigger=32 --level0_stop_writes_trigger=48 --benchmarks=fillrandom,stats --key_size=16 --value_size=64 --num_column_families=1 --threads=16 --write_buffer_size=67108864 --use_remote_flush=1 --min_write_buffer_number_to_merge=8 --subcompactions=4 --compaction_readahead_size=10485760 --disable_wal=1 --db=/tmp/test --memnode_heartbeat_port=10086 --report_fillrandom_latency_and_load=true --track_flush_compaction_stats=true --statistics=true --memnode_ip=10.10.1.7 --memnode_port=9091 --local_ip=10.10.1.4 --compression_type=none
+```
